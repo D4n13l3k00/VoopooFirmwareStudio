@@ -1,0 +1,20 @@
+# Build output and local IDE state
+/build/
+/out/
+/.vs/
+/.agents/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.pdb
+*.ilk
+*.obj
+*.aps
+*.log
+imgui.ini
+/exported-assets/
+/exported-fonts/
+__pycache__/
+.DS_Store
+Thumbs.db

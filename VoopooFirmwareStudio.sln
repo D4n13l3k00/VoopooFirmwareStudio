@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.9.12128.139 oobstable
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "VoopooFirmwareStudio", "VoopooFirmwareStudio.vcxproj", "{6E447364-814B-4F34-B740-9D5129726C7C}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Repacker|x64 = Repacker|x64
+		Repacker-Flasher|x64 = Repacker-Flasher|x64
+		Repacker-Fonts|x64 = Repacker-Fonts|x64
+		Repacker-Fonts-Flasher|x64 = Repacker-Fonts-Flasher|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6E447364-814B-4F34-B740-9D5129726C7C}.Repacker|x64.ActiveCfg = Repacker|x64
+		{6E447364-814B-4F34-B740-9D5129726C7C}.Repacker|x64.Build.0 = Repacker|x64
+		{6E447364-814B-4F34-B740-9D5129726C7C}.Repacker-Flasher|x64.ActiveCfg = Repacker-Flasher|x64
+		{6E447364-814B-4F34-B740-9D5129726C7C}.Repacker-Flasher|x64.Build.0 = Repacker-Flasher|x64
+		{6E447364-814B-4F34-B740-9D5129726C7C}.Repacker-Fonts|x64.ActiveCfg = Repacker-Fonts|x64
+		{6E447364-814B-4F34-B740-9D5129726C7C}.Repacker-Fonts|x64.Build.0 = Repacker-Fonts|x64
+		{6E447364-814B-4F34-B740-9D5129726C7C}.Repacker-Fonts-Flasher|x64.ActiveCfg = Repacker-Fonts-Flasher|x64
+		{6E447364-814B-4F34-B740-9D5129726C7C}.Repacker-Fonts-Flasher|x64.Build.0 = Repacker-Fonts-Flasher|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {7064C3F7-1063-41D3-A521-D807D7DDE63C}
+	EndGlobalSection
+EndGlobal
