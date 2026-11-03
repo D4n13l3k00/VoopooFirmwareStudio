@@ -45,8 +45,8 @@ std::vector<PaletteState> GetDefaultPalette() {
         { { "rank_cyan", "Rank / cyan", "Score rank cyan palette", Rgb8(0x01, 0xE7, 0xF2) }, Rgb8(0x01, 0xE7, 0xF2) },
         { { "rank_orange", "Rank / orange", "Score rank orange palette", Rgb8(0xF2, 0x53, 0x00) }, Rgb8(0xF2, 0x53, 0x00) },
         { { "rank_red", "Rank / red", "Score rank red palette", Rgb8(0xF2, 0x01, 0x33) }, Rgb8(0xF2, 0x01, 0x33) },
-        { { "digits_wattage", "Wattage digits", "Large wattage readout on main screen (20x37)", Rgb8(0xFF, 0xFF, 0xFF) }, Rgb8(0xFF, 0xFF, 0xFF) },
-        { { "digits_stats", "Stats digits", "Puff counter, voltage, and resistance digits (11x21)", Rgb8(0xFF, 0xFF, 0xFF) }, Rgb8(0xFF, 0xFF, 0xFF) },
+        { { "digits_wattage", "Wattage digits", "Large wattage readout on main screen (19x40)", Rgb8(0xFF, 0xFF, 0xFF) }, Rgb8(0xFF, 0xFF, 0xFF) },
+        { { "digits_stats", "Stats digits", "Puff counter digits (11x20), foreground only", Rgb8(0xFF, 0xFF, 0xFF) }, Rgb8(0xFF, 0xFF, 0xFF) },
     };
 }
 

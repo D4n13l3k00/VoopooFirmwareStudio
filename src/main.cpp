@@ -29,26 +29,19 @@
 #include "i18n.h"
 
 #include "ui_resource_studio.h"
+#include "../tests/editor_regressions.h"
+#include "../tests/firmware_color_audit.h"
+#include "../tests/history_regressions.h"
+#include "../tests/save_regressions.h"
 #include "ui_firmware_info.h"
 
-#if STUDIO_FONTS
 #include "ui_font_generator.h"
-#endif
 
-#if STUDIO_FLASHER
-#include "ui_device_flasher.h"
-#include "voopoo_usb_flasher.h"
-#include "flash_protocol.h"
-#endif
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
-#if STUDIO_FLASHER
-#pragma comment(lib, "hid.lib")
-#pragma comment(lib, "setupapi.lib")
-#endif
 
 namespace fs = std::filesystem;
 
@@ -60,10 +53,8 @@ static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
 static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
 static std::function<void()>   g_RenderCallback = nullptr;
 static bool                     g_InSizeMove = false;
+static bool                     g_CloseRequested = false;
 
-#if STUDIO_FLASHER
-static bool g_requestOpenFlasherTab = false;
-#endif
 
 // Drag & Drop files queue
 static std::vector<std::string> g_DroppedFiles;
@@ -224,12 +215,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
         logF << "StudioState created.\n" << std::flush;
         studio.statusMsg = Tr(i18n::Str::MsgReadyOpenFw);
 
-#if STUDIO_FLASHER
-        // Initialize Voopoo USB HID Flasher background monitoring
-        logF << "Starting Voopoo USB Flasher monitoring...\n" << std::flush;
-        voopoo::UsbFlasher flasher;
-        if (!smokeTest) flasher.StartMonitoring(1000);
-#endif
 
         FirmwarePackage base;
         std::string baseError;
@@ -254,17 +239,39 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                 if (!studio.firmware.PackWith({}, {}, packed, report, baseError) ||
                     packed != studio.firmware.source_bytes) return 3;
                 logF << "ROUNDTRIP OK" << std::endl;
+                if (!RunEditorRegressions(g_pd3dDevice, g_pd3dDeviceContext, baseError)) {
+                    logF << "EDITOR REGRESSIONS FAILED: " << baseError << std::endl;
+                    return 20;
+                }
+                logF << "EDITOR REGRESSIONS OK" << std::endl;
+                if (!RunHistoryRegressions(baseError)) {
+                    logF << "HISTORY REGRESSIONS FAILED: " << baseError << std::endl;
+                    return 22;
+                }
+                logF << "HISTORY REGRESSIONS OK" << std::endl;
+                if (!RunSaveRegressions(baseError)) {
+                    logF << "SAVE REGRESSIONS FAILED: " << baseError << std::endl;
+                    return 23;
+                }
+                logF << "SAVE REGRESSIONS OK" << std::endl;
+                if (!RunFirmwareColorAudit(studio, baseError)) {
+                    logF << "FIRMWARE COLOR AUDIT FAILED: " << baseError << std::endl;
+                    return 21;
+                }
+                logF << "PACKED FIRMWARE COLORS OK (all themes + custom palette)" << std::endl;
                 size_t whiteGlyphs = 0;
                 for (const auto& spec : studio.catalog) {
                     if (spec.id.rfind("font_", 0) != 0) continue;
-                    studio.assetColorOverrides[spec.id] = Rgb8(255, 0, 0);
+                    studio.assetPaintColors[spec.id] = Rgb8(255, 0, 0);
                     const auto color = studio.GetForegroundForAsset(spec);
-                    studio.assetColorOverrides.erase(spec.id);
-                    if (color.r != 255 || color.g != 255 || color.b != 255) return 4;
+                    studio.assetPaintColors.erase(spec.id);
+                    const char* role = PaletteIdForAsset(spec, studio.previewRank, studio.previewCyanMode);
+                    const auto expected = role ? studio.GetPaletteColor(role) : Rgb8(255, 255, 255);
+                    if (color != expected) return 4;
                     ++whiteGlyphs;
                 }
                 if (!whiteGlyphs) return 4;
-                logF << "WHITE GLYPHS OK count=" << whiteGlyphs << std::endl;
+                logF << "FIRMWARE GLYPH COLORS OK count=" << whiteGlyphs << std::endl;
 
                 // --- 5.3: Expanded Smoke Tests ---
                 // Test 1: Parser resilience test (verify graceful failure on invalid/corrupted payloads)
@@ -308,7 +315,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                 // Test 3: Unicode path I/O test
                 {
                     std::string uniFilename = "test_unicode_\xd1\x8e\xd0\xbd\xd0\xb8\xd0\xba\xd0\xbe\xd0\xb4_" + PathUtils::FormatTimestampNow() + ".tmp";
-                    std::string uniPath = (fs::temp_directory_path() / PathUtils::ToFsPath(uniFilename)).string();
+                    std::string uniPath = PathUtils::WideToUtf8((fs::temp_directory_path() / PathUtils::ToFsPath(uniFilename)).wstring());
                     auto outUni = PathUtils::OpenWriteStream(uniPath);
                     if (!outUni.is_open()) {
                         logF << "UNICODE PATH WRITE FAILED: " << uniPath << std::endl;
@@ -335,23 +342,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                     logF << "UNICODE PATH IO TESTS OK" << std::endl;
                 }
 
-#if STUDIO_FLASHER
-                if (!voopoo::protocol::RunTests(studio.firmware, baseError)) {
-                    logF << "PROTOCOL TESTS FAILED: " << baseError << std::endl;
-                    return 5;
-                }
-                logF << "PROTOCOL TESTS OK (offline, no USB)" << std::endl;
-#endif
             }
         }
 
-#if STUDIO_FONTS
         // Font Generator State
         logF << "Initializing FontGenState...\n" << std::flush;
         FontGenState fontState;
         fontState.Init();
         logF << "Found " << fontState.popularFonts.size() << " fonts.\n" << std::flush;
-#endif
 
         logF << "Entering main loop...\n" << std::flush;
 
@@ -371,11 +369,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                 }
             }
             if (done) break;
+            if (g_CloseRequested) {
+                g_CloseRequested = false;
+                if (UiResourceStudio::ConfirmUnsavedChanges(studio, hwnd)) {
+                    done = true;
+                    break;
+                }
+            }
 
             // Handle Drag & Drop files
             if (!g_DroppedFiles.empty()) {
-                for (const auto& dropPath : g_DroppedFiles) {
+                const auto droppedFiles = std::move(g_DroppedFiles);
+                g_DroppedFiles.clear();
+                for (const auto& dropPath : droppedFiles) {
                     if (fs::is_directory(PathUtils::ToFsPath(dropPath))) {
+                        studio.PushUndo(std::string(Tr(i18n::Str::BtnImportFolder)) + ": " + dropPath);
                         int imported = 0;
                         for (const auto& entry : fs::directory_iterator(PathUtils::ToFsPath(dropPath))) {
                             if (!entry.is_regular_file()) continue;
@@ -394,12 +402,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                                     if (FirmwareBitmap::LoadAndFitRgb565(p, spec.width, spec.height, rgba, err)) {
                                         std::vector<uint8_t> newRaw;
                                         if (FirmwareBitmap::EncodeRgb565(rgba.data(), spec.width, spec.height, newRaw)) {
-                                            if (newRaw == studio.originals[matchedIdx]) {
-                                                studio.replacements.erase(spec.id);
-                                            } else {
-                                                studio.replacements[spec.id] = std::move(newRaw);
-                                                imported++;
-                                            }
+                                            if (newRaw != studio.originals[matchedIdx]) imported++;
+                                            studio.SetBitmapReplacement(matchedIdx, std::move(newRaw));
                                         }
                                     }
                                 } else {
@@ -408,12 +412,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                                     if (FirmwareBitmap::LoadAndFit(p, spec.width, spec.height, gray, err)) {
                                         std::vector<uint8_t> newRaw;
                                         if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[matchedIdx].data(), spec.byte_len(), newRaw)) {
-                                            if (newRaw == studio.originals[matchedIdx]) {
-                                                studio.replacements.erase(spec.id);
-                                            } else {
-                                                studio.replacements[spec.id] = std::move(newRaw);
-                                                imported++;
-                                            }
+                                            if (newRaw != studio.originals[matchedIdx]) imported++;
+                                            studio.SetBitmapReplacement(matchedIdx, std::move(newRaw));
                                         }
                                     }
                                 }
@@ -429,18 +429,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
                     if (ext == ".zwdf" || ext == ".swdf") {
-                        std::string err;
-                        if (studio.OpenFirmware(dropPath, err)) {
-                            char _m[512]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgOpenedFwDragDrop), fs::path(PathUtils::ToFsPath(dropPath)).filename().string().c_str());
-                            studio.statusMsg = _m;
-                            studio.statusIsErr = false;
-                        } else {
-                            char _m[512]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgDragDropError), err.c_str());
-                            studio.statusMsg = _m;
-                            studio.statusIsErr = true;
-                        }
+                        UiResourceStudio::OpenFirmware(studio, hwnd, dropPath);
                     }
-#if STUDIO_FONTS
                     else if (ext == ".ttf" || ext == ".otf") {
                         if (fontState.fontRenderer.LoadFontFile(dropPath)) {
                             fontState.fontDisplayName = fs::path(PathUtils::ToFsPath(dropPath)).stem().string();
@@ -454,7 +444,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                             studio.statusIsErr = true;
                         }
                     }
-#endif
                     else if (ext == ".png" && studio.hasFirmware) {
                         std::string stem = fs::path(PathUtils::ToFsPath(dropPath)).stem().string();
                         if (stem == "boot_voopoo_animated_horizontal_136x22") stem = "boot_voopoo_animated";
@@ -472,14 +461,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                                     std::vector<uint8_t> newRaw;
                                     if (FirmwareBitmap::EncodeRgb565(rgba.data(), spec.width, spec.height, newRaw)) {
                                         if (newRaw == studio.originals[matchedIdx]) {
-                                            studio.replacements.erase(spec.id);
                                             char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgPngMatchesOriginal), spec.id.c_str());
                                             studio.statusMsg = _m;
                                         } else {
-                                            studio.replacements[spec.id] = std::move(newRaw);
                                             char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgStagedReplacement), spec.id.c_str());
                                             studio.statusMsg = _m;
                                         }
+                                        studio.SetBitmapReplacement(matchedIdx, std::move(newRaw));
                                         studio.statusIsErr = false;
                                     }
                                 } else {
@@ -494,14 +482,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                                     std::vector<uint8_t> newRaw;
                                     if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[matchedIdx].data(), spec.byte_len(), newRaw)) {
                                         if (newRaw == studio.originals[matchedIdx]) {
-                                            studio.replacements.erase(spec.id);
                                             char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgPngMatchesOriginal), spec.id.c_str());
                                             studio.statusMsg = _m;
                                         } else {
-                                            studio.replacements[spec.id] = std::move(newRaw);
                                             char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgStagedReplacement), spec.id.c_str());
                                             studio.statusMsg = _m;
                                         }
+                                        studio.SetBitmapReplacement(matchedIdx, std::move(newRaw));
                                         studio.statusIsErr = false;
                                     }
                                 } else {
@@ -513,13 +500,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                         }
                     }
                 }
-                g_DroppedFiles.clear();
             }
 
             // Define frame rendering lambda
             auto RenderFrame = [&]() {
                 static bool s_inRender = false;
-                if (s_inRender) return;
+                if (s_inRender || UiResourceStudio::IsFileActionActive()) return;
                 s_inRender = true;
 
                 // Handle window resize
@@ -555,7 +541,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                 if (studio.hasFirmware) {
                     std::string shortHash = studio.firmware.source_sha256.substr(0, 10);
                     std::transform(shortHash.begin(), shortHash.end(), shortHash.begin(), ::toupper);
-                    std::string fwName = fs::path(PathUtils::ToFsPath(studio.firmwarePath)).filename().string();
+                    std::string fwName = PathUtils::WideToUtf8(PathUtils::ToFsPath(studio.firmwarePath).filename().wstring());
                     if (studio.isBuiltin) {
                         fwName += " (";
                         fwName += Tr(i18n::Str::LabelBuiltin);
@@ -568,38 +554,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                         studio.firmware.records.size(),
                         studio.replacements.size());
                     ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.5f, 1.0f), "%s", fBuf);
+                    if (studio.HasUnsavedChanges()) {
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", Tr(i18n::Str::LabelModified));
+                    }
                 } else {
                     ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "%s", Tr(i18n::Str::BadgeNoFirmware));
                 }
 
-#if STUDIO_FLASHER
-                // Top Right: Live USB Device Connection & Flasher Badge
-                auto topDevInfo = flasher.GetDeviceInfo();
-                auto topFlashProg = flasher.GetFlashProgress();
-                bool topIsFlashing = (topFlashProg.state != voopoo::FlashState::Idle &&
-                                      topFlashProg.state != voopoo::FlashState::FinishedSuccess &&
-                                      topFlashProg.state != voopoo::FlashState::Failed);
-
-                ImGui::SameLine();
-                float badgeEstimatedWidth = 400.0f;
-                float availX = ImGui::GetContentRegionAvail().x;
-                if (availX > badgeEstimatedWidth) {
-                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + availX - badgeEstimatedWidth);
-                }
-
-                if (topIsFlashing) {
-                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), Tr(i18n::Str::BadgeFlashing), topFlashProg.progress * 100.0f, topFlashProg.status_text.c_str());
-                } else if (topDevInfo.connected) {
-                    if (topDevInfo.in_bootloader) {
-                        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.1f, 1.0f), "%s", Tr(i18n::Str::BadgeUsbBootloader));
-                    } else {
-                        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "[USB: %s (ID: %s)]",
-                            topDevInfo.product.c_str(), topDevInfo.hardware_id.c_str());
-                    }
-                } else {
-                    ImGui::TextColored(ImVec4(0.55f, 0.55f, 0.55f, 1.0f), "%s", Tr(i18n::Str::BadgeUsbNoDevice));
-                }
-#endif
 
                 ImGui::Separator();
 
@@ -610,36 +572,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
 
                 ImGui::BeginChild("MainWorkspace", ImVec2(0.0f, workspaceHeight), false, ImGuiWindowFlags_NoScrollbar);
                 {
-#if STUDIO_FLASHER
-                    auto devInfo = flasher.GetDeviceInfo();
-                    auto flashProg = flasher.GetFlashProgress();
-                    bool usbConnected = devInfo.connected;
-                    bool isFlashing = (flashProg.state != voopoo::FlashState::Idle &&
-                                       flashProg.state != voopoo::FlashState::FinishedSuccess &&
-                                       flashProg.state != voopoo::FlashState::Failed);
-#else
-                    bool usbConnected = false;
-                    bool isFlashing = false;
-                    bool g_requestOpenFlasherTab = false;
-#endif
 
                     // Main Tab Bar
                     if (ImGui::BeginTabBar("MainTabBar", ImGuiTabBarFlags_None)) {
                         // TAB 1: Resource Studio
-                        UiResourceStudio::RenderTab(studio, hwnd, g_pd3dDevice, g_pd3dDeviceContext, usbConnected, isFlashing, g_requestOpenFlasherTab);
+                        UiResourceStudio::RenderTab(studio, hwnd, g_pd3dDevice, g_pd3dDeviceContext);
 
-#if STUDIO_FONTS
                         // TAB 2: Font Generator
                         UiFontGenerator::RenderTab(studio, fontState, hwnd, smokeTest, debugFrame);
-#endif
 
                         // TAB 3: Firmware Info
                         UiFirmwareInfo::RenderTab(studio);
 
-#if STUDIO_FLASHER
-                        // TAB 4: Device Flasher (1-Click USB Firmware Flashing)
-                        UiDeviceFlasher::RenderTab(studio, flasher, hwnd, g_requestOpenFlasherTab, smokeTest, debugFrame);
-#endif
 
                         ImGui::EndTabBar();
                     }
@@ -694,8 +638,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                     }
                     ImGui::SameLine();
                     if (ImGui::Button(Tr(i18n::Str::BtnOpenInExplorer), ImVec2(140, 0))) {
-                        std::string dir = fs::path(PathUtils::ToFsPath(studio.lastBuildPath)).parent_path().string();
-                        std::wstring wDir = PathUtils::Utf8ToWide(dir);
+                        const std::wstring wDir = PathUtils::ToFsPath(studio.lastBuildPath).parent_path().wstring();
                         ShellExecuteW(nullptr, L"open", wDir.c_str(), nullptr, nullptr, SW_SHOWDEFAULT);
                         ImGui::CloseCurrentPopup();
                     }
@@ -705,7 +648,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
             ImGui::End();
 
             // Global Keyboard Shortcuts
-            if (!ImGui::GetIO().WantTextInput) {
+            if (!ImGui::GetIO().WantTextInput && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
                 ImGuiIO& curIo = ImGui::GetIO();
                 bool ctrl = curIo.KeyCtrl;
                 bool shift = curIo.KeyShift;
@@ -742,81 +685,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                 }
                 // Ctrl + O: Open firmware
                 else if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_O)) {
-                    std::string picked;
-                    if (PathUtils::PickFileDialog(hwnd, L"VOOPOO Firmware (*.zwdf;*.swdf)\0*.zwdf;*.swdf\0All Files (*.*)\0*.*\0", picked)) {
-                        std::string err;
-                        if (studio.OpenFirmware(picked, err)) {
-                            char _m[512];
-                            snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgSuccessOpened), fs::path(PathUtils::ToFsPath(picked)).filename().string().c_str());
-                            studio.statusMsg = _m;
-                            studio.statusIsErr = false;
-                        } else {
-                            char _m[512];
-                            snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgOpenError), err.c_str());
-                            studio.statusMsg = _m;
-                            studio.statusIsErr = true;
-                        }
-                    }
+                    UiResourceStudio::OpenFirmware(studio, hwnd);
                 }
                 // Ctrl + S: Build firmware
                 else if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_S)) {
-                    if (studio.hasFirmware) {
-                        std::string defName = fs::path(PathUtils::ToFsPath(studio.firmwarePath)).stem().string() + "_custom.zwdf";
-                        std::string savePath;
-                        if (PathUtils::SaveFileDialog(hwnd, L"VOOPOO Firmware (*.zwdf)\0*.zwdf\0", defName, savePath)) {
-                            if (savePath == studio.firmwarePath) {
-                                studio.statusMsg = Tr(i18n::Str::MsgRefuseOverwrite);
-                                studio.statusIsErr = true;
-                            } else {
-                                std::string err;
-                                std::vector<CodePatch> codePatches;
-                                if (!BuildColorPatches(studio.firmware, studio.palette, studio.backgroundColor, codePatches, err)) {
-                                    char _m[512]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgColorPatchError), err.c_str());
-                                    studio.statusMsg = _m;
-                                    studio.statusIsErr = true;
-                                } else {
-                                    std::map<std::string, std::pair<std::vector<size_t>, std::vector<uint8_t>>> repMap;
-                                    for (size_t i = 0; i < studio.catalog.size(); ++i) {
-                                        const auto& spec = studio.catalog[i];
-                                        auto it = studio.replacements.find(spec.id);
-                                        if (it != studio.replacements.end()) {
-                                            repMap[spec.id] = { studio.locations[i], it->second };
-                                        }
-                                    }
-
-                                    std::vector<uint8_t> outBytes;
-                                    BuildReport rep;
-                                    if (!studio.firmware.PackWith(repMap, codePatches, outBytes, rep, err)) {
-                                        char _m[512]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgPackError), err.c_str());
-                                        studio.statusMsg = _m;
-                                        studio.statusIsErr = true;
-                                    } else {
-                                        if (fs::exists(PathUtils::ToFsPath(savePath))) {
-                                            std::string bak = savePath + ".bak." + PathUtils::FormatTimestampNow();
-                                            fs::copy_file(PathUtils::ToFsPath(savePath), PathUtils::ToFsPath(bak), fs::copy_options::overwrite_existing);
-                                        }
-
-                                        auto outF = PathUtils::OpenWriteStream(savePath);
-                                        outF.write((const char*)outBytes.data(), outBytes.size());
-                                        outF.close();
-
-                                        std::string repPath = fs::path(PathUtils::ToFsPath(savePath)).replace_extension(".report.json").string();
-                                        auto repF = PathUtils::OpenWriteStream(repPath, std::ios::out);
-                                        repF << rep.ToJson();
-                                        repF.close();
-
-                                        studio.lastReport = rep;
-                                        studio.lastBuildPath = savePath;
-                                        studio.showBuildModal = true;
-                                        char _m[512];
-                                        snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgBuildSuccess), fs::path(PathUtils::ToFsPath(savePath)).filename().string().c_str());
-                                        studio.statusMsg = _m;
-                                        studio.statusIsErr = false;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    UiResourceStudio::SaveFirmware(studio, hwnd);
                 }
                 // Up / Down arrow navigation across visible assets
                 else if (!ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
@@ -865,9 +738,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
     g_RenderCallback = nullptr;
 
         // Cleanup
-#if STUDIO_FLASHER
-        flasher.StopMonitoring();
-#endif
         ImGui_ImplDX11_Shutdown();
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
@@ -957,13 +827,19 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return true;
 
     switch (msg) {
+    case WM_CLOSE:
+        // Defer prompting until outside WndProc and any active ImGui frame.
+        g_CloseRequested = true;
+        return 0;
     case WM_DROPFILES:
     {
         HDROP hDrop = (HDROP)wParam;
         UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
         for (UINT i = 0; i < count; ++i) {
-            wchar_t path[MAX_PATH];
-            if (DragQueryFileW(hDrop, i, path, MAX_PATH)) {
+            const UINT length = DragQueryFileW(hDrop, i, nullptr, 0);
+            std::wstring path(static_cast<size_t>(length) + 1, L'\0');
+            if (DragQueryFileW(hDrop, i, path.data(), length + 1)) {
+                path.resize(length);
                 g_DroppedFiles.push_back(PathUtils::WideToUtf8(path));
             }
         }

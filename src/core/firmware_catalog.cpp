@@ -1,12 +1,43 @@
 #include "firmware_catalog.h"
+#include "zwdf_package.h"
 #include <cstdio>
 
-const char* PaletteIdForAsset(const AssetSpec& spec) {
-    // Glyphs are one-bit masks; do not assign them the fallback accent color.
-    if (spec.id.rfind("font_", 0) == 0) return nullptr;
+// Foregrounds verified against the 3103 bitmap draw call sites. These RGB
+// constants are independent of the theme's patched palette instructions.
+Rgb8 FixedForegroundForAsset(const AssetSpec& spec) {
+    const auto& id = spec.id;
+    if (id == "toggle_01") return {118, 255, 0};
+    if (id == "logo_drag_s") return {220, 199, 0};
+    if (id == "banner_activated") return {243, 219, 1};
+    if (id == "icon_puff_cleared") return {255, 220, 0};
+    if (id == "icon_unlock_large") return {90, 225, 1};
+    if (id == "icon_check_atomizer_base") return {0, 223, 255};
+    if (id == "icon_max_power" || id == "icon_time_out" || id == "icon_temp_high")
+        return {234, 99, 0};
+    if (id == "icon_lock_large" || id == "icon_low_power" || id == "icon_check_battery" ||
+        id == "icon_atomizer_short" || id == "icon_check_atomizer_tank") return {235, 0, 1};
+    return {255, 255, 255};
+}
 
-    if (spec.id.rfind("rank_icon_", 0) == 0 || spec.id.rfind("rank_label_", 0) == 0) {
-        switch (spec.ordinal) {
+bool AssetUsesModeColor(const AssetSpec& spec) {
+    const auto& id = spec.id;
+    return id.rfind("mode_", 0) == 0 || id == "label_puff" || id == "label_time" ||
+        id == "unit_ohm" || id == "unit_v" || id.rfind("font_11x20_", 0) == 0;
+}
+
+const char* PaletteIdForAsset(const AssetSpec& spec, size_t previewRank, bool cyanMode) {
+    const auto& id = spec.id;
+    if (id.rfind("font_19x40_", 0) == 0) return "digits_wattage";
+    if (id.rfind("font_11x20_", 0) == 0) return "digits_stats";
+    if (id == "status_00" || id == "toggle_00") return "accent_red";
+    if (id == "status_01") return "accent_cyan";
+    if (AssetUsesModeColor(spec)) return cyanMode ? "accent_cyan" : "accent_red";
+    if (id.rfind("state_", 0) == 0 || id == "logo_voopoo" ||
+        id == "panel_chip_id" || id == "panel_level_code") return "highlight_yellow";
+    if (id.rfind("rank_icon_", 0) == 0 || id.rfind("meter_", 0) == 0) {
+        // Meter ordinal selects an animation frame, never the rank color.
+        const size_t rank = id.rfind("meter_", 0) == 0 ? previewRank : spec.ordinal;
+        switch (rank) {
         case 1: return "rank_bronze";
         case 3: return "rank_gold";
         case 4: return "rank_ice";
@@ -16,29 +47,49 @@ const char* PaletteIdForAsset(const AssetSpec& spec) {
         default: return nullptr;
         }
     }
+    // No group-wide fallback: mask colors come from their actual draw call.
+    return nullptr;
+}
 
-    // All alert dialog boxes (frames and text) are rendered in pure white (0xFFFF) in firmware
-    if (spec.id.rfind("alert_", 0) == 0) return nullptr;
-
-    // Boot screens: DRAG S logo is yellow in firmware, GENE.TT is white, RGB565 boot logos are native color
-    if (spec.id == "logo_drag_s") return "highlight_yellow";
-    if (spec.id == "boot_gene_chip") return nullptr;
-    if (spec.id == "boot_voopoo_animated" || spec.id == "screen_off") return nullptr;
-
-    // Specific alert & UI component color mappings
-    if (spec.id == "icon_puff_cleared") return "highlight_yellow";
-    if (spec.id == "icon_unlock_large") return "accent_cyan";
-    if (spec.id.rfind("icon_", 0) == 0) return "accent_red";
-
-    if (spec.id == "battery_bolt") return "highlight_yellow";
-    if (spec.id == "battery_frame") return "accent_cyan";
-    if (spec.id == "logo_voopoo") return "highlight_yellow";
-
-    if (spec.group == "Alerts") return "accent_red";
-    if (spec.group == "Screens") return "highlight_yellow";
-    if (spec.group == "Labels") return "accent_cyan";
-    if (spec.group == "Controls") return "accent_red";
-    return "accent_red";
+Rgb8 FirmwareFixedForeground(const FirmwarePackage& fw, const AssetSpec& spec, size_t previewRank) {
+    // This profile is specifically the 3103 image. Never interpret these offsets
+    // in another hardware variant. Theme patches do not touch the sites below.
+    const HardwareRecord* rec = nullptr;
+    for (const auto& item : fw.records)
+        if (item.device_code[0] == 0x31 && item.device_code[1] == 0x03 && item.linked_base == 0x08005800)
+            rec = &item;
+    if (!rec) return FixedForegroundForAsset(spec);
+    const auto& id = spec.id;
+    size_t off = 0;
+    if (id == "logo_drag_s") off = 0x2828;
+    else if (id == "icon_atomizer_short") off = 0x2d68;
+    else if (id == "icon_check_atomizer_tank") off = 0x30dc;
+    else if (id == "icon_check_atomizer_base") off = 0x30e8;
+    else if (id == "icon_check_battery") off = 0x3168;
+    else if (id == "icon_low_power") off = 0x31d0;
+    else if (id == "icon_max_power") off = 0x3240;
+    else if (id == "icon_puff_cleared") off = 0x32b0;
+    else if (id == "icon_temp_high") off = 0x3318;
+    else if (id == "icon_time_out") off = 0x3380;
+    else if (id == "icon_unlock_large") off = 0x33e8;
+    else if (id == "banner_activated") off = 0x348a;
+    else if (id == "icon_lock_large") off = 0x34bc;
+    if (off && off + 6 <= rec->image.size()) {
+        Rgb8 color;
+        if (DecodeColorInstruction(rec->image.data() + off, color)) return color;
+    }
+    if (id == "toggle_01" && rec->image.size() > 0x55bd &&
+        rec->image[0x55b7] == 0x22 && rec->image[0x55bb] == 0x21 && rec->image[0x55bd] == 0x20)
+        return {rec->image[0x55bc], rec->image[0x55ba], rec->image[0x55b6]};
+    if (id.rfind("rank_icon_", 0) == 0 || id.rfind("meter_", 0) == 0) {
+        const size_t rank = id.rfind("meter_", 0) == 0 ? previewRank : spec.ordinal;
+        if (rank == 0 || rank == 2) {
+            const size_t colorOff = 0xae04 + rank * 12 + 8; // table @ 0x08010604
+            if (colorOff + 2 <= rec->image.size())
+                return Rgb8::FromRgb565(rec->image[colorOff] | (rec->image[colorOff + 1] << 8));
+        }
+    }
+    return FixedForegroundForAsset(spec);
 }
 
 static void AddSeries(
@@ -151,8 +202,8 @@ std::vector<AssetSpec> GetAllAssets() {
         { "banner_activated", "Banner ACTIVATED (Rank)", "Labels", 0x0801048C, 72, 11 },
 
         // Category 3: Standby UI & Battery
-        { "label_puff", "Label Puff", "Labels", 0x080105AA, 32, 10 },
-        { "label_time", "Label Time", "Labels", 0x080105D2, 32, 10 },
+        { "label_puff", "Label Puff", "Labels", 0x080105AA, 28, 10 },
+        { "label_time", "Label Time", "Labels", 0x080105D2, 30, 10 },
         { "battery_frame", "Battery Gauge Frame", "Controls", 0x08012990, 47, 17 },
         { "battery_bolt", "Battery Charging Bolt", "Controls", 0x080130B8, 11, 13 },
     };

@@ -2,12 +2,17 @@ name: CI & Release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - 'v*'
+  pull_request:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,7 +20,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build & Release (Windows x64 MSBuild)
+    name: Build & Test (Windows x64 MSBuild)
     runs-on: windows-latest
 
     steps:
@@ -29,8 +34,9 @@ jobs:
         shell: pwsh
         run: |
           git fetch origin master
-          $isOnMaster = git branch -r --contains HEAD | Where-Object { $_ -match 'origin/master' }
-          if (-not $isOnMaster) {
+          if ($LASTEXITCODE -ne 0) { throw "Cannot fetch origin/master" }
+          git merge-base --is-ancestor HEAD origin/master
+          if ($LASTEXITCODE -ne 0) {
             Write-Error "Tag $env:GITHUB_REF_NAME must be on origin/master branch!"
             exit 1
           }
@@ -38,29 +44,23 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build All Configurations (x64)
+      - name: Build Release (x64)
         run: |
-          msbuild VoopooFirmwareStudio.sln /p:Configuration=Repacker /p:Platform=x64 /m /v:m
-          msbuild VoopooFirmwareStudio.sln /p:Configuration=Repacker-Fonts /p:Platform=x64 /m /v:m
-          msbuild VoopooFirmwareStudio.sln /p:Configuration=Repacker-Flasher /p:Platform=x64 /m /v:m
-          msbuild VoopooFirmwareStudio.sln /p:Configuration=Repacker-Fonts-Flasher /p:Platform=x64 /m /v:m
+          msbuild VoopooFirmwareStudio.sln /p:Configuration=Release /p:Platform=x64 /m /v:m
 
       - name: Run Smoke Tests
         shell: pwsh
         run: |
-          .\build\Repacker\VoopooFirmwareStudio.exe --smoke-test
-          .\build\Repacker-Fonts\VoopooFirmwareStudio.exe --smoke-test
-          .\build\Repacker-Flasher\VoopooFirmwareStudio.exe --smoke-test
-          .\build\Repacker-Fonts-Flasher\VoopooFirmwareStudio.exe --smoke-test
+          $process = Start-Process -FilePath .\build\Release\VoopooFirmwareStudio.exe -ArgumentList '--smoke-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Smoke tests failed with exit code $($process.ExitCode)"
+          }
 
       - name: Prepare release binaries
         shell: pwsh
         run: |
-          $ver = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v1.0.0" }
-          Copy-Item build/Repacker/VoopooFirmwareStudio.exe ./VoopooFirmwareStudio-$ver-Repacker.exe -Force
-          Copy-Item build/Repacker-Fonts/VoopooFirmwareStudio.exe ./VoopooFirmwareStudio-$ver-Repacker-Fonts.exe -Force
-          Copy-Item build/Repacker-Flasher/VoopooFirmwareStudio.exe ./VoopooFirmwareStudio-$ver-Repacker-Flasher.exe -Force
-          Copy-Item build/Repacker-Fonts-Flasher/VoopooFirmwareStudio.exe ./VoopooFirmwareStudio-$ver-Repacker-Fonts-Flasher.exe -Force
+          $ver = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME } else { $env:GITHUB_SHA.Substring(0, 8) }
+          Copy-Item build/Release/VoopooFirmwareStudio.exe ./VoopooFirmwareStudio-$ver-Release.exe -Force
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -69,14 +69,42 @@ jobs:
           path: VoopooFirmwareStudio-*.exe
           if-no-files-found: error
 
+  release:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read release notes from annotated tag
+        shell: bash
+        run: |
+          if [ "$(git cat-file -t "$GITHUB_REF")" != tag ]; then
+            echo "Release requires an annotated tag containing release notes." >&2
+            exit 1
+          fi
+          git for-each-ref --format='%(contents)' "$GITHUB_REF" > "$RUNNER_TEMP/release-notes.md"
+          test -s "$RUNNER_TEMP/release-notes.md"
+
+      - name: Download verified binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: VoopooFirmwareStudio-windows-x64
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           name: Voopoo Firmware Studio ${{ github.ref_name }}
           files: VoopooFirmwareStudio-*.exe
-          generate_release_notes: true
+          body_path: ${{ runner.temp }}/release-notes.md
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false
           make_latest: true

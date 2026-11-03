@@ -56,7 +56,8 @@ void RenderPaletteEditor(StudioState& studio) {
     float roleColFloat[3] = { sCol.r / 255.0f, sCol.g / 255.0f, sCol.b / 255.0f };
     if (ImGui::ColorEdit3("##RoleColEdit", roleColFloat, ImGuiColorEditFlags_NoInputs)) {
         Rgb8 picked((uint8_t)(roleColFloat[0] * 255.0f + 0.5f), (uint8_t)(roleColFloat[1] * 255.0f + 0.5f), (uint8_t)(roleColFloat[2] * 255.0f + 0.5f));
-        curEntry.current = picked;
+        studio.PushUndo(std::string(Tr(i18n::Str::LabelRole)) + ": " + curEntry.spec.id);
+        studio.SetPaletteColor(studio.selectedPaletteIdx, picked);
         strncpy_s(studio.hexEditBuf, picked.ToHex().c_str(), sizeof(studio.hexEditBuf));
         studio.textureNeedsUpdate = true;
     }
@@ -65,13 +66,15 @@ void RenderPaletteEditor(StudioState& studio) {
     if (ImGui::InputText("##RoleHex", studio.hexEditBuf, sizeof(studio.hexEditBuf), ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_CharsUppercase)) {
         Rgb8 parsed;
         if (Rgb8::ParseHex(studio.hexEditBuf, parsed)) {
-            curEntry.current = parsed;
+            studio.PushUndo(std::string(Tr(i18n::Str::LabelHex)) + ": " + curEntry.spec.id);
+            studio.SetPaletteColor(studio.selectedPaletteIdx, parsed);
             studio.textureNeedsUpdate = true;
         }
     }
     ImGui::SameLine();
     if (ImGui::Button(Tr(i18n::Str::BtnResetRole), ImVec2(-1.0f, 0))) {
-        curEntry.current = curEntry.spec.original;
+        studio.PushUndo(std::string(Tr(i18n::Str::BtnResetRole)) + ": " + curEntry.spec.id);
+        studio.SetPaletteColor(studio.selectedPaletteIdx, curEntry.spec.original);
         strncpy_s(studio.hexEditBuf, curEntry.current.ToHex().c_str(), sizeof(studio.hexEditBuf));
         studio.textureNeedsUpdate = true;
     }

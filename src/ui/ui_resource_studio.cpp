@@ -2,28 +2,147 @@
 #include "ui_pixel_editor.h"
 #include "ui_palette.h"
 #include "path_utils.h"
+#include "firmware_save.h"
+#include <commctrl.h>
+
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #include "../imgui/imgui.h"
 
 namespace UiResourceStudio {
 
-static std::string FormatTimestampNow() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t tt = std::chrono::system_clock::to_time_t(now);
-    std::tm tm;
-    localtime_s(&tm, &tt);
-    char buf[32];
-    strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
-    return std::string(buf);
+bool UpdateReferenceTexture(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D11DeviceContext* context) {
+    const auto& spec = studio.catalog[catIdx];
+    const auto* refRaw = studio.GetReferenceRaw(catIdx);
+    if (!refRaw) { studio.referencePreviewTexture.Release(); return false; }
+    const auto fgCol = studio.GetForegroundForAsset(spec).ScreenColor();
+    std::vector<uint32_t> refRgba;
+    if (spec.format == AssetFormat::Rgb565) {
+        FirmwareBitmap::DecodeRgb565(refRaw, spec.byte_len(), spec.width, spec.height, refRgba);
+    } else {
+        std::vector<uint8_t> gray;
+        FirmwareBitmap::DecodeMask(refRaw, spec.byte_len(), spec.width, spec.height, gray);
+        FirmwareBitmap::ColorizeMask(gray.data(), spec.width, spec.height, fgCol, studio.GetBackgroundForAsset(spec).ScreenColor(), refRgba);
+    }
+    // Reference content, dimensions and palette can all change while the SRV stays valid.
+    return studio.referencePreviewTexture.Update(device, context, refRgba.data(), spec.width, spec.height);
+}
+
+
+
+static bool fileActionActive = false;
+
+bool IsFileActionActive() { return fileActionActive; }
+
+struct FileActionScope {
+    bool previous = fileActionActive;
+    FileActionScope() { fileActionActive = true; }
+    ~FileActionScope() { fileActionActive = previous; }
+};
+
+static std::string DescribeSaveError(const AtomicFile::Error& error) {
+    i18n::Str message = i18n::Str::SaveIdentityError;
+    switch (error.stage) {
+    case AtomicFile::Stage::Temporary: message = i18n::Str::SaveTemporaryError; break;
+    case AtomicFile::Stage::Write: message = i18n::Str::SaveWriteError; break;
+    case AtomicFile::Stage::Flush: message = i18n::Str::SaveFlushError; break;
+    case AtomicFile::Stage::Close: message = i18n::Str::SaveCloseError; break;
+    case AtomicFile::Stage::Backup: message = i18n::Str::SaveBackupError; break;
+    case AtomicFile::Stage::Commit: message = i18n::Str::SaveCommitError; break;
+    default: break;
+    }
+    char text[1024];
+    snprintf(text, sizeof(text), Tr(i18n::Str::MsgWindowsErrorCode), Tr(message), error.code);
+    return text;
+}
+
+bool SaveFirmware(StudioState& studio, HWND hwnd, bool showSuccessModal) {
+    if (!studio.hasFirmware) return false;
+    FileActionScope scope;
+    const std::string defaultName = PathUtils::WideToUtf8(
+        PathUtils::ToFsPath(studio.firmwarePath).stem().wstring()) + "_custom.zwdf";
+    std::string path;
+    if (!PathUtils::SaveFileDialog(hwnd, L"VOOPOO Firmware (*.zwdf)\0*.zwdf\0", defaultName, path))
+        return false;
+    const auto result = FirmwareSave::Save(studio, path);
+    char text[1536];
+    if (!result.FirmwareSaved()) {
+        const auto error = result.buildError.empty() ? DescribeSaveError(result.fileError) : result.buildError;
+        snprintf(text, sizeof(text), Tr(i18n::Str::MsgSaveError), error.c_str());
+        studio.statusIsErr = true;
+    } else if (result.outcome == FirmwareSave::Outcome::FirmwareOnly) {
+        snprintf(text, sizeof(text), Tr(i18n::Str::MsgFirmwareOnlySaved),
+                 DescribeSaveError(result.fileError).c_str());
+        studio.statusIsErr = true;
+    } else {
+        snprintf(text, sizeof(text), Tr(i18n::Str::MsgBuildSuccess),
+                 PathUtils::WideToUtf8(PathUtils::ToFsPath(path).filename().wstring()).c_str());
+        studio.statusIsErr = false;
+        studio.showBuildModal = showSuccessModal;
+    }
+    studio.statusMsg = text;
+    if (studio.statusIsErr) {
+        // Also visible when a successful firmware-only save immediately opens
+        // another document or closes the application.
+        MessageBoxW(hwnd, PathUtils::Utf8ToWide(studio.statusMsg).c_str(),
+                    PathUtils::Utf8ToWide(Tr(i18n::Str::AppTitle)).c_str(),
+                    MB_OK | (result.FirmwareSaved() ? MB_ICONWARNING : MB_ICONERROR));
+    }
+    return result.FirmwareSaved();
+}
+
+bool ConfirmUnsavedChanges(StudioState& studio, HWND hwnd) {
+    if (!studio.HasUnsavedChanges()) return true;
+    FileActionScope scope;
+    const auto title = PathUtils::Utf8ToWide(Tr(i18n::Str::UnsavedTitle));
+    const auto prompt = PathUtils::Utf8ToWide(Tr(i18n::Str::UnsavedPrompt));
+    const auto save = PathUtils::Utf8ToWide(Tr(i18n::Str::BtnSaveChanges));
+    const auto discard = PathUtils::Utf8ToWide(Tr(i18n::Str::BtnDiscardChanges));
+    const auto cancel = PathUtils::Utf8ToWide(Tr(i18n::Str::BtnCancelAction));
+    const TASKDIALOG_BUTTON buttons[] = {{IDYES, save.c_str()}, {IDNO, discard.c_str()}, {IDCANCEL, cancel.c_str()}};
+    TASKDIALOGCONFIG config{};
+    config.cbSize = sizeof(config);
+    config.hwndParent = hwnd;
+    config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    config.pszWindowTitle = title.c_str();
+    config.pszMainInstruction = prompt.c_str();
+    config.pszMainIcon = TD_WARNING_ICON;
+    config.cButtons = static_cast<UINT>(std::size(buttons));
+    config.pButtons = buttons;
+    config.nDefaultButton = IDCANCEL;
+    int choice = IDCANCEL;
+    if (FAILED(TaskDialogIndirect(&config, &choice, nullptr, nullptr))) return false;
+    if (choice == IDNO) return true;
+    return choice == IDYES && SaveFirmware(studio, hwnd, false);
+}
+
+bool OpenFirmware(StudioState& studio, HWND hwnd, const std::string& requestedPath) {
+    FileActionScope scope;
+    std::string path = requestedPath;
+    if (path.empty() && !PathUtils::PickFileDialog(hwnd,
+            L"VOOPOO Firmware (*.zwdf;*.swdf)\0*.zwdf;*.swdf\0All Files (*.*)\0*.*\0", path))
+        return false;
+    if (!ConfirmUnsavedChanges(studio, hwnd)) return false;
+    std::string error;
+    const bool opened = studio.OpenFirmware(path, error);
+    char text[1024];
+    if (opened) {
+        snprintf(text, sizeof(text), Tr(i18n::Str::MsgSuccessOpened),
+                 PathUtils::WideToUtf8(PathUtils::ToFsPath(path).filename().wstring()).c_str());
+        studio.showBuildModal = false;
+    } else {
+        snprintf(text, sizeof(text), Tr(i18n::Str::MsgOpenError), error.c_str());
+    }
+    studio.statusMsg = text;
+    studio.statusIsErr = !opened;
+    return opened;
 }
 
 void RenderTab(
     StudioState& studio,
     HWND hwnd,
     ID3D11Device* device,
-    ID3D11DeviceContext* context,
-    bool usbConnected,
-    bool isFlashing,
-    bool& requestOpenFlasherTab
+    ID3D11DeviceContext* context
 ) {
     char _tb[128];
     snprintf(_tb, sizeof(_tb), "%s###TabResStudio", Tr(i18n::Str::TabResourceStudio));
@@ -38,21 +157,7 @@ void RenderTab(
 
     // Top Actions Bar
     if (ImGui::Button(Tr(i18n::Str::BtnOpenFirmware))) {
-        std::string picked;
-        if (PathUtils::PickFileDialog(hwnd, L"VOOPOO Firmware (*.zwdf;*.swdf)\0*.zwdf;*.swdf\0All Files (*.*)\0*.*\0", picked)) {
-            std::string err;
-            if (studio.OpenFirmware(picked, err)) {
-                char _m[512];
-                snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgSuccessOpened), fs::path(picked).filename().string().c_str());
-                studio.statusMsg = _m;
-                studio.statusIsErr = false;
-            } else {
-                char _m[512];
-                snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgOpenError), err.c_str());
-                studio.statusMsg = _m;
-                studio.statusIsErr = true;
-            }
-        }
+        OpenFirmware(studio, hwnd);
     }
 
     if (!studio.hasFirmware) ImGui::BeginDisabled();
@@ -127,12 +232,11 @@ void RenderTab(
                         std::vector<uint8_t> newRaw;
                         if (FirmwareBitmap::EncodeRgb565(rgba.data(), spec.width, spec.height, newRaw)) {
                             if (newRaw == studio.originals[i]) {
-                                studio.replacements.erase(spec.id);
                                 unchanged++;
                             } else {
-                                studio.replacements[spec.id] = std::move(newRaw);
                                 changed++;
                             }
+                            studio.SetBitmapReplacement(i, std::move(newRaw));
                         }
                     }
                 } else {
@@ -142,12 +246,11 @@ void RenderTab(
                         std::vector<uint8_t> newRaw;
                         if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[i].data(), spec.byte_len(), newRaw)) {
                             if (newRaw == studio.originals[i]) {
-                                studio.replacements.erase(spec.id);
                                 unchanged++;
                             } else {
-                                studio.replacements[spec.id] = std::move(newRaw);
                                 changed++;
                             }
+                            studio.SetBitmapReplacement(i, std::move(newRaw));
                         }
                     }
                 }
@@ -161,83 +264,9 @@ void RenderTab(
     }
     AutoSameLine(Tr(i18n::Str::BtnBuildFirmware));
     if (ImGui::Button(Tr(i18n::Str::BtnBuildFirmware), ImVec2(0, 0))) {
-        std::string defName = fs::path(studio.firmwarePath).stem().string() + "_custom.zwdf";
-        std::string savePath;
-        if (PathUtils::SaveFileDialog(hwnd, L"VOOPOO Firmware (*.zwdf)\0*.zwdf\0", defName, savePath)) {
-            if (savePath == studio.firmwarePath) {
-                studio.statusMsg = Tr(i18n::Str::MsgRefuseOverwrite);
-                studio.statusIsErr = true;
-            } else {
-                std::string err;
-                std::vector<CodePatch> codePatches;
-                if (!BuildColorPatches(studio.firmware, studio.palette, studio.backgroundColor, codePatches, err)) {
-                    char _m[512];
-                    snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgColorPatchError), err.c_str());
-                    studio.statusMsg = _m;
-                    studio.statusIsErr = true;
-                } else {
-                    std::map<std::string, std::pair<std::vector<size_t>, std::vector<uint8_t>>> repMap;
-                    for (size_t i = 0; i < studio.catalog.size(); ++i) {
-                        const auto& spec = studio.catalog[i];
-                        auto it = studio.replacements.find(spec.id);
-                        if (it != studio.replacements.end()) {
-                            repMap[spec.id] = { studio.locations[i], it->second };
-                        }
-                    }
-
-                    std::vector<uint8_t> outBytes;
-                    BuildReport rep;
-                    if (!studio.firmware.PackWith(repMap, codePatches, outBytes, rep, err)) {
-                        char _m[512];
-                        snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgPackError), err.c_str());
-                        studio.statusMsg = _m;
-                        studio.statusIsErr = true;
-                    } else {
-                        if (fs::exists(PathUtils::ToFsPath(savePath))) {
-                            std::string bak = savePath + ".bak." + FormatTimestampNow();
-                            fs::copy_file(PathUtils::ToFsPath(savePath), PathUtils::ToFsPath(bak), fs::copy_options::overwrite_existing);
-                        }
-
-                        auto outF = PathUtils::OpenWriteStream(savePath);
-                        outF.write((const char*)outBytes.data(), outBytes.size());
-                        outF.close();
-
-                        std::string repPath = fs::path(savePath).replace_extension(".report.json").string();
-                        auto repF = PathUtils::OpenWriteStream(repPath);
-                        repF << rep.ToJson();
-                        repF.close();
-
-                        studio.lastReport = rep;
-                        studio.lastBuildPath = savePath;
-                        studio.showBuildModal = true;
-                        char _m[512];
-                        snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgBuildSuccess), fs::path(savePath).filename().string().c_str());
-                        studio.statusMsg = _m;
-                        studio.statusIsErr = false;
-                    }
-                }
-            }
-        }
+        SaveFirmware(studio, hwnd);
     }
 
-#if STUDIO_FLASHER
-    bool canQuickFlash = studio.hasFirmware && usbConnected && !isFlashing;
-    AutoSameLine(Tr(i18n::Str::BtnFlashToDevice));
-    if (!canQuickFlash) ImGui::BeginDisabled();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.55f, 0.30f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.70f, 0.38f, 1.0f));
-    if (ImGui::Button(Tr(i18n::Str::BtnFlashToDevice), ImVec2(0, 0))) {
-        requestOpenFlasherTab = true;
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-        if (!studio.hasFirmware) ImGui::SetTooltip("%s", Tr(i18n::Str::TooltipOpenOrLoad));
-        else if (!usbConnected) ImGui::SetTooltip("%s", Tr(i18n::Str::TooltipNoDeviceUsb));
-        else if (isFlashing) ImGui::SetTooltip("%s", Tr(i18n::Str::TooltipFlashingInProgress));
-        else ImGui::SetTooltip("%s", Tr(i18n::Str::TooltipOpenDeviceFlasher));
-    }
-    ImGui::PopStyleColor(2);
-    if (!canQuickFlash) ImGui::EndDisabled();
-#endif
 
     if (studio.hasFirmware) {
         AutoSameLine(Tr(i18n::Str::BtnUndo));
@@ -353,14 +382,11 @@ void RenderTab(
 
                     bool isModified = (studio.replacements.find(spec.id) != studio.replacements.end());
                     bool isStock = studio.IsActiveMatchingReference(catIdx);
-                    bool hasCustomCol = (studio.assetColorOverrides.find(spec.id) != studio.assetColorOverrides.end());
 
                     if (isModified) {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.2f, 1.0f));
                     } else if (!isStock) {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.2f, 1.0f));
-                    } else if (hasCustomCol) {
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.9f, 1.0f, 1.0f));
                     }
 
                     char itemLabel[256];
@@ -373,7 +399,7 @@ void RenderTab(
                         strncpy_s(studio.assetHexEditBuf, c.ToHex().c_str(), sizeof(studio.assetHexEditBuf));
                         studio.textureNeedsUpdate = true;
                     }
-                    if (isModified || !isStock || hasCustomCol) {
+                    if (isModified || !isStock) {
                         ImGui::PopStyleColor();
                     }
                 }
@@ -400,17 +426,23 @@ void RenderTab(
 
             ImGui::SeparatorText(spec.title.c_str());
 
-            Rgb8 fgCol = studio.GetForegroundForAsset(spec).ScreenColor();
-            bool hasCustomColor = (studio.assetColorOverrides.find(spec.id) != studio.assetColorOverrides.end());
-            if (hasCustomColor) {
-                ImGui::Text(Tr(i18n::Str::LabelMetaDetailsCustom), spec.id.c_str(), spec.group.c_str(), fgCol.ToHex().c_str());
-            } else {
-                const char* pal = PaletteIdForAsset(spec);
-                const char* colName = pal ? GetRoleLabelTr(pal) : Tr(i18n::Str::ColorPresetWhite);
-                ImGui::Text(Tr(i18n::Str::LabelMetaDetails), spec.id.c_str(), spec.group.c_str(), colName);
+            if (AssetUsesModeColor(spec)) {
+                if (ImGui::Checkbox(Tr(i18n::Str::LabelPreviewCyanMode), &studio.previewCyanMode))
+                    studio.textureNeedsUpdate = true;
             }
-            ImGui::SameLine();
-            ImGui::ColorButton("##AssetColorSwatch", ImVec4(fgCol.r / 255.0f, fgCol.g / 255.0f, fgCol.b / 255.0f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(16, 16));
+            if (spec.id.rfind("meter_", 0) == 0) {
+                if (ImGui::SliderInt(Tr(i18n::Str::LabelPreviewRank), &studio.previewRank, 0, 7))
+                    studio.textureNeedsUpdate = true;
+            }
+            Rgb8 fgCol = studio.GetForegroundForAsset(spec).ScreenColor();
+            const char* pal = PaletteIdForAsset(spec, studio.previewRank, studio.previewCyanMode);
+            const std::string fixedColorName = fgCol.ToHex();
+            const char* colName = spec.format == AssetFormat::Rgb565 ? "RGB565" : (pal ? GetRoleLabelTr(pal) : fixedColorName.c_str());
+            ImGui::Text(Tr(i18n::Str::LabelMetaDetails), spec.id.c_str(), spec.group.c_str(), colName);
+            if (spec.format != AssetFormat::Rgb565) {
+                ImGui::SameLine();
+                ImGui::ColorButton("##AssetColorSwatch", ImVec4(fgCol.r / 255.0f, fgCol.g / 255.0f, fgCol.b / 255.0f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(16, 16));
+            }
             ImGui::Text(Tr(i18n::Str::LabelMetaHardware),
                 spec.address, spec.width, spec.height, spec.byte_len(), studio.firmware.records.size());
 
@@ -448,14 +480,13 @@ void RenderTab(
                             if (FirmwareBitmap::EncodeRgb565(rgba.data(), spec.width, spec.height, newRaw)) {
                                 studio.PushUndo("Replace " + spec.id + " from PNG");
                                 if (newRaw == studio.originals[catIdx]) {
-                                    studio.replacements.erase(spec.id);
                                     char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgReplacedMatchedOriginal), spec.id.c_str());
                                     studio.statusMsg = _m;
                                 } else {
-                                    studio.replacements[spec.id] = std::move(newRaw);
                                     char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgStagedRgbReplacement), spec.id.c_str());
                                     studio.statusMsg = _m;
                                 }
+                                studio.SetBitmapReplacement(catIdx, std::move(newRaw));
                                 studio.statusIsErr = false;
                                 studio.textureNeedsUpdate = true;
                             }
@@ -472,14 +503,13 @@ void RenderTab(
                             if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
                                 studio.PushUndo("Replace " + spec.id + " from PNG");
                                 if (newRaw == studio.originals[catIdx]) {
-                                    studio.replacements.erase(spec.id);
                                     char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgReplacedMatchedOriginal), spec.id.c_str());
                                     studio.statusMsg = _m;
                                 } else {
-                                    studio.replacements[spec.id] = std::move(newRaw);
                                     char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgStagedReplacementCustom), spec.id.c_str());
                                     studio.statusMsg = _m;
                                 }
+                                studio.SetBitmapReplacement(catIdx, std::move(newRaw));
                                 studio.statusIsErr = false;
                                 studio.textureNeedsUpdate = true;
                             }
@@ -495,7 +525,7 @@ void RenderTab(
                 AutoSameLine(Tr(i18n::Str::BtnRestoreOriginal));
                 if (ImGui::Button(Tr(i18n::Str::BtnRestoreOriginal))) {
                     studio.PushUndo("Restore " + spec.id);
-                    studio.replacements.erase(spec.id);
+                    studio.SetBitmapReplacement(catIdx, studio.originals[catIdx]);
                     char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgRestoredOriginal), spec.id.c_str());
                     studio.statusMsg = _m;
                     studio.statusIsErr = false;
@@ -524,13 +554,7 @@ void RenderTab(
                         const uint8_t* raw = studio.GetCurrentRaw(catIdx);
                         std::vector<uint32_t> rgba;
                         FirmwareBitmap::DecodeRgb565(raw, spec.byte_len(), spec.width, spec.height, rgba);
-                        if (hasCustomColor) {
-                            std::vector<uint32_t> recolored;
-                            FirmwareBitmap::RecolorRgb565(rgba.data(), spec.width, spec.height, fgCol, recolored);
-                            ok = FirmwareBitmap::SavePngRgb565(outPath, recolored.data(), spec.width, spec.height, err);
-                        } else {
-                            ok = FirmwareBitmap::SavePngRgb565(outPath, rgba.data(), spec.width, spec.height, err);
-                        }
+                        ok = FirmwareBitmap::SavePngRgb565(outPath, rgba.data(), spec.width, spec.height, err);
                     } else {
                         std::vector<uint8_t> gray;
                         const uint8_t* raw = studio.GetCurrentRaw(catIdx);
@@ -571,42 +595,22 @@ void RenderTab(
                 }
             }
 
-            // Color Override Section
             ImGui::Spacing();
-            ImGui::SeparatorText(Tr(i18n::Str::LabelPreviewTint));
-            const bool isFontMask = spec.id.rfind("font_", 0) == 0;
-            if (isFontMask) {
-                ImGui::TextDisabled("%s", Tr(i18n::Str::InfoDigitsMonochrome));
+            if (spec.format == AssetFormat::Rgb565) {
+                ImGui::SeparatorText(Tr(i18n::Str::LabelBrushColor));
+                const Rgb8 brush = studio.GetPaintColor(spec).ScreenColor();
+                float color[3] = {brush.r / 255.0f, brush.g / 255.0f, brush.b / 255.0f};
+                if (ImGui::ColorEdit3("##Rgb565Brush", color)) {
+                    studio.PushUndo(std::string(Tr(i18n::Str::LabelBrushColor)) + ": " + spec.id);
+                    studio.SetAssetPaintColor(spec.id, {
+                        (uint8_t)(color[0] * 255 + 0.5f), (uint8_t)(color[1] * 255 + 0.5f),
+                        (uint8_t)(color[2] * 255 + 0.5f)});
+                }
+                ImGui::TextDisabled("%s", Tr(i18n::Str::InfoNativeRgb565));
             } else {
-                ImGui::TextDisabled("%s", Tr(i18n::Str::InfoPreviewNotSaved));
-            }
-
-            float customColFloat[3] = { fgCol.r / 255.0f, fgCol.g / 255.0f, fgCol.b / 255.0f };
-            ImGui::Text("%s:", Tr(i18n::Str::LabelPreviewOnly));
-            ImGui::SameLine();
-            if (ImGui::ColorEdit3("##AssetCustomCol", customColFloat, ImGuiColorEditFlags_NoInputs)) {
-                Rgb8 picked((uint8_t)(customColFloat[0] * 255.0f + 0.5f), (uint8_t)(customColFloat[1] * 255.0f + 0.5f), (uint8_t)(customColFloat[2] * 255.0f + 0.5f));
-                studio.assetColorOverrides[spec.id] = picked;
-                strncpy_s(studio.assetHexEditBuf, picked.ToHex().c_str(), sizeof(studio.assetHexEditBuf));
-                studio.textureNeedsUpdate = true;
-            }
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(80.0f);
-            if (ImGui::InputText("##AssetCustomHex", studio.assetHexEditBuf, sizeof(studio.assetHexEditBuf), ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_CharsUppercase)) {
-                Rgb8 parsed;
-                if (Rgb8::ParseHex(studio.assetHexEditBuf, parsed)) {
-                    studio.assetColorOverrides[spec.id] = parsed;
-                    studio.textureNeedsUpdate = true;
-                }
-            }
-            ImGui::SameLine();
-            if (hasCustomColor) {
-                if (ImGui::Button(Tr(i18n::Str::BtnResetColor))) {
-                    studio.assetColorOverrides.erase(spec.id);
-                    Rgb8 c = studio.GetForegroundForAsset(spec);
-                    strncpy_s(studio.assetHexEditBuf, c.ToHex().c_str(), sizeof(studio.assetHexEditBuf));
-                    studio.textureNeedsUpdate = true;
-                }
+                ImGui::TextDisabled("%s", Tr(i18n::Str::InfoFirmwareColors));
+                const std::string bgHex = studio.GetBackgroundForAsset(spec).ScreenColor().ToHex();
+                ImGui::Text(Tr(i18n::Str::LabelPreviewBackground), bgHex.c_str());
             }
 
             // View Controls
@@ -642,19 +646,22 @@ void RenderTab(
                     float canvasW = spec.width * pZoom;
                     float canvasH = spec.height * pZoom;
 
-                    std::vector<uint32_t> refRgba;
-                    if (spec.format == AssetFormat::Rgb565) {
-                        FirmwareBitmap::DecodeRgb565(refRaw, spec.byte_len(), spec.width, spec.height, refRgba);
-                    } else {
-                        std::vector<uint8_t> gray;
-                        FirmwareBitmap::DecodeMask(refRaw, spec.byte_len(), spec.width, spec.height, gray);
-                        FirmwareBitmap::ColorizeMask(gray.data(), spec.width, spec.height, fgCol, studio.backgroundColor.ScreenColor(), refRgba);
-                    }
-                    if (!studio.referencePreviewTexture.IsValid()) {
-                        studio.referencePreviewTexture.Update(device, context, refRgba.data(), spec.width, spec.height);
-                    }
+                    UpdateReferenceTexture(studio, catIdx, device, context);
                     if (studio.referencePreviewTexture.IsValid()) {
                         ImGui::Image((ImTextureID)studio.referencePreviewTexture.GetSRV(), ImVec2(canvasW, canvasH));
+                        if (studio.previewShowGrid && studio.previewZoom >= 4) {
+                            const ImVec2 origin = ImGui::GetItemRectMin();
+                            ImDrawList* drawList = ImGui::GetWindowDrawList();
+                            const ImU32 gridColor = IM_COL32(80, 80, 90, 110);
+                            for (uint32_t x = 1; x < spec.width; ++x) {
+                                const float screenX = origin.x + x * pZoom;
+                                drawList->AddLine(ImVec2(screenX, origin.y), ImVec2(screenX, origin.y + canvasH), gridColor);
+                            }
+                            for (uint32_t y = 1; y < spec.height; ++y) {
+                                const float screenY = origin.y + y * pZoom;
+                                drawList->AddLine(ImVec2(origin.x, screenY), ImVec2(origin.x + canvasW, screenY), gridColor);
+                            }
+                        }
                     }
                 }
             }

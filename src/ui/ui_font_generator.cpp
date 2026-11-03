@@ -1,4 +1,3 @@
-#if STUDIO_FONTS
 
 #include "ui_font_generator.h"
 #include "path_utils.h"
@@ -173,7 +172,7 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
                                 const auto& spec = studio.catalog[i];
                                 std::vector<uint8_t> newRaw;
                                 if (FirmwareBitmap::EncodeMaskPreserving(g.pixels.data(), spec.width, spec.height, studio.originals[i].data(), spec.byte_len(), newRaw)) {
-                                    studio.replacements[assetId] = std::move(newRaw);
+                                    studio.SetBitmapReplacement(i, std::move(newRaw));
                                     stagedCount++;
                                 }
                                 break;
@@ -210,7 +209,7 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
                                 const auto& spec = studio.catalog[catIdx];
                                 std::vector<uint8_t> newRaw;
                                 if (FirmwareBitmap::EncodeMaskPreserving(g.pixels.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
-                                    studio.replacements[assetId] = std::move(newRaw);
+                                    studio.SetBitmapReplacement(catIdx, std::move(newRaw));
                                     totalStaged++;
                                 }
                             }
@@ -409,6 +408,3 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
 }
 
 } // namespace UiFontGenerator
-
-#endif // STUDIO_FONTS
-

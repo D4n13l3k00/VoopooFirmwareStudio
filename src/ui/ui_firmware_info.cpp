@@ -67,10 +67,6 @@ void RenderTab(StudioState& studio) {
 
             ImGui::Spacing();
             ImGui::SeparatorText(Tr(i18n::Str::FwInfoInstructionsTitle));
-#if STUDIO_FLASHER
-            ImGui::BulletText("%s", Tr(i18n::Str::FwInfoBulletDirectFlash));
-            ImGui::BulletText("%s", Tr(i18n::Str::FwInfoBulletNoDrivers));
-#endif
             ImGui::BulletText("%s", Tr(i18n::Str::FwInfoBulletBuildZwdf));
         }
 

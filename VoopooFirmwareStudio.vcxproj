@@ -1,20 +1,8 @@
 <?xml version='1.0' encoding='utf-8'?>
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003" DefaultTargets="Build" ToolsVersion="Current">
   <ItemGroup Label="ProjectConfigurations">
-    <ProjectConfiguration Include="Repacker|x64">
-      <Configuration>Repacker</Configuration>
-      <Platform>x64</Platform>
-    </ProjectConfiguration>
-    <ProjectConfiguration Include="Repacker-Fonts|x64">
-      <Configuration>Repacker-Fonts</Configuration>
-      <Platform>x64</Platform>
-    </ProjectConfiguration>
-    <ProjectConfiguration Include="Repacker-Flasher|x64">
-      <Configuration>Repacker-Flasher</Configuration>
-      <Platform>x64</Platform>
-    </ProjectConfiguration>
-    <ProjectConfiguration Include="Repacker-Fonts-Flasher|x64">
-      <Configuration>Repacker-Fonts-Flasher</Configuration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
   </ItemGroup>
@@ -40,22 +28,6 @@
     <TargetName>VoopooFirmwareStudio</TargetName>
     <LocalDebuggerWorkingDirectory>$(OutDir)</LocalDebuggerWorkingDirectory>
   </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)'=='Repacker'">
-    <StudioFonts>0</StudioFonts>
-    <StudioFlasher>0</StudioFlasher>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)'=='Repacker-Fonts'">
-    <StudioFonts>1</StudioFonts>
-    <StudioFlasher>0</StudioFlasher>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)'=='Repacker-Flasher'">
-    <StudioFonts>0</StudioFonts>
-    <StudioFlasher>1</StudioFlasher>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)'=='Repacker-Fonts-Flasher'">
-    <StudioFonts>1</StudioFonts>
-    <StudioFlasher>1</StudioFlasher>
-  </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -69,8 +41,8 @@
       <ExceptionHandling>Sync</ExceptionHandling>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\flasher;$(ProjectDir)src\font;$(ProjectDir)src\ui;$(ProjectDir)src\utils;$(ProjectDir)imgui;$(ProjectDir)imgui\backends;$(ProjectDir)third_party;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>NDEBUG;_CRT_SECURE_NO_WARNINGS;STUDIO_FONTS=$(StudioFonts);STUDIO_FLASHER=$(StudioFlasher);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\font;$(ProjectDir)src\ui;$(ProjectDir)src\utils;$(ProjectDir)imgui;$(ProjectDir)imgui\backends;$(ProjectDir)third_party;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>NDEBUG;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -83,44 +55,24 @@
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
   </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(StudioFlasher)'=='1'">
-    <Link>
-      <AdditionalDependencies>hid.lib;setupapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
-    </Link>
-  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\core\embedded_firmware.cpp" />
     <ClCompile Include="src\core\firmware_bitmap.cpp" />
     <ClCompile Include="src\core\firmware_catalog.cpp" />
     <ClCompile Include="src\core\firmware_color.cpp" />
     <ClCompile Include="src\core\zwdf_package.cpp" />
-    <ClCompile Include="src\flasher\flash_protocol.cpp">
-      <ExcludedFromBuild Condition="'$(StudioFlasher)'!='1'">true</ExcludedFromBuild>
-    </ClCompile>
-    <ClCompile Include="src\flasher\voopoo_usb_flasher.cpp">
-      <ExcludedFromBuild Condition="'$(StudioFlasher)'!='1'">true</ExcludedFromBuild>
-    </ClCompile>
     <ClCompile Include="src\font\font_renderer.cpp">
-      <ExcludedFromBuild Condition="'$(StudioFonts)'!='1'">true</ExcludedFromBuild>
-    </ClCompile>
+      </ClCompile>
     <ClCompile Include="src\font\presets.cpp">
-      <ExcludedFromBuild Condition="'$(StudioFonts)'!='1'">true</ExcludedFromBuild>
-    </ClCompile>
-    <ClCompile Include="src\ui\ui_device_flasher.cpp">
-      <ExcludedFromBuild Condition="'$(StudioFlasher)'!='1'">true</ExcludedFromBuild>
-    </ClCompile>
+      </ClCompile>
     <ClCompile Include="src\ui\ui_firmware_info.cpp" />
     <ClCompile Include="src\ui\ui_font_generator.cpp">
-      <ExcludedFromBuild Condition="'$(StudioFonts)'!='1'">true</ExcludedFromBuild>
-    </ClCompile>
+      </ClCompile>
     <ClCompile Include="src\ui\ui_palette.cpp" />
     <ClCompile Include="src\ui\ui_pixel_editor.cpp" />
     <ClCompile Include="src\ui\ui_resource_studio.cpp" />
     <ClCompile Include="src\utils\i18n.cpp" />
     <ClCompile Include="src\main.cpp" />
-    <ClCompile Include="tests\flash_protocol_tests.cpp">
-      <ExcludedFromBuild Condition="'$(StudioFlasher)'!='1'">true</ExcludedFromBuild>
-    </ClCompile>
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />
     <ClCompile Include="imgui\imgui_tables.cpp" />
@@ -129,26 +81,29 @@
     <ClCompile Include="imgui\backends\imgui_impl_win32.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="tests\editor_regressions.h" />
+    <ClInclude Include="tests\firmware_color_audit.h" />
+    <ClInclude Include="tests\history_regressions.h" />
+    <ClInclude Include="tests\save_regressions.h" />
     <ClInclude Include="src\core\app_state.h" />
     <ClInclude Include="src\core\embedded_firmware.h" />
     <ClInclude Include="src\core\firmware_bitmap.h" />
     <ClInclude Include="src\core\firmware_catalog.h" />
     <ClInclude Include="src\core\firmware_color.h" />
     <ClInclude Include="src\core\zwdf_package.h" />
-    <ClInclude Include="src\flasher\flash_protocol.h" />
-    <ClInclude Include="src\flasher\voopoo_usb_flasher.h" />
     <ClInclude Include="src\font\font_renderer.h" />
     <ClInclude Include="src\font\presets.h" />
-    <ClInclude Include="src\ui\ui_device_flasher.h" />
     <ClInclude Include="src\ui\ui_firmware_info.h" />
     <ClInclude Include="src\ui\ui_font_generator.h" />
     <ClInclude Include="src\ui\ui_palette.h" />
+    <ClInclude Include="tests\editor_regressions.h" />
     <ClInclude Include="src\ui\ui_pixel_editor.h" />
     <ClInclude Include="src\ui\ui_resource_studio.h" />
     <ClInclude Include="src\utils\i18n.h" />
     <ClInclude Include="src\utils\path_utils.h" />
+    <ClInclude Include="src\utils\atomic_file.h" />
+    <ClInclude Include="src\utils\firmware_save.h" />
     <ClInclude Include="src\utils\texture_cache.h" />
-    <ClInclude Include="tests\official_vectors.h" />
     <ClInclude Include="imgui\imconfig.h" />
     <ClInclude Include="imgui\imgui.h" />
     <ClInclude Include="imgui\imgui_internal.h" />

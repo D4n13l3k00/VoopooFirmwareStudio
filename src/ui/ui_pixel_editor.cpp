@@ -143,7 +143,7 @@ void RenderToolbar(StudioState& studio, size_t catIdx) {
             }
             std::vector<uint8_t> newRaw;
             if (FirmwareBitmap::EncodeRgb565(rgba.data(), spec.width, spec.height, newRaw)) {
-                studio.replacements[spec.id] = std::move(newRaw);
+                studio.SetBitmapReplacement(catIdx, std::move(newRaw));
             }
         } else {
             std::vector<uint8_t> gray;
@@ -153,7 +153,7 @@ void RenderToolbar(StudioState& studio, size_t catIdx) {
             }
             std::vector<uint8_t> newRaw;
             if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
-                studio.replacements[spec.id] = std::move(newRaw);
+                studio.SetBitmapReplacement(catIdx, std::move(newRaw));
             }
         }
         studio.textureNeedsUpdate = true;
@@ -167,13 +167,13 @@ void RenderToolbar(StudioState& studio, size_t catIdx) {
             std::vector<uint32_t> rgba((size_t)spec.width * spec.height, 0xFF000000);
             std::vector<uint8_t> newRaw;
             if (FirmwareBitmap::EncodeRgb565(rgba.data(), spec.width, spec.height, newRaw)) {
-                studio.replacements[spec.id] = std::move(newRaw);
+                studio.SetBitmapReplacement(catIdx, std::move(newRaw));
             }
         } else {
             std::vector<uint8_t> gray((size_t)spec.width * spec.height, 0);
             std::vector<uint8_t> newRaw;
             if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
-                studio.replacements[spec.id] = std::move(newRaw);
+                studio.SetBitmapReplacement(catIdx, std::move(newRaw));
             }
         }
         studio.textureNeedsUpdate = true;
@@ -182,8 +182,8 @@ void RenderToolbar(StudioState& studio, size_t catIdx) {
 
 void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D11DeviceContext* context) {
     const auto& spec = studio.catalog[catIdx];
-    Rgb8 bg = studio.backgroundColor.ScreenColor();
-    Rgb8 fgCol = studio.GetForegroundForAsset(spec).ScreenColor();
+    Rgb8 bg = studio.GetBackgroundForAsset(spec).ScreenColor();
+    Rgb8 fgCol = (spec.format == AssetFormat::Rgb565 ? studio.GetPaintColor(spec) : studio.GetForegroundForAsset(spec)).ScreenColor();
     float pZoom = (float)studio.previewZoom;
     float canvasW = spec.width * pZoom;
     float canvasH = spec.height * pZoom;
@@ -193,11 +193,6 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
     std::vector<uint32_t> activeRgba;
     if (spec.format == AssetFormat::Rgb565) {
         FirmwareBitmap::DecodeRgb565(raw, spec.byte_len(), spec.width, spec.height, activeRgba);
-        if (studio.assetColorOverrides.find(spec.id) != studio.assetColorOverrides.end()) {
-            std::vector<uint32_t> recolored;
-            FirmwareBitmap::RecolorRgb565(activeRgba.data(), spec.width, spec.height, fgCol, recolored);
-            activeRgba = std::move(recolored);
-        }
     } else {
         std::vector<uint8_t> gray;
         FirmwareBitmap::DecodeMask(raw, spec.byte_len(), spec.width, spec.height, gray);
@@ -219,11 +214,13 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
     ImU32 colBg = IM_COL32(bg.r, bg.g, bg.b, 255);
     drawList->AddRectFilled(p0, p1, colBg);
 
-    // Hardware Texture Rendering with Point Sampling
+    // Image is display-only: the button owns mouse capture for both drawing buttons.
+    ImGui::PushID(spec.id.c_str());
+    ImGui::InvisibleButton("##CanvasInteractive", ImVec2(canvasW, canvasH),
+        ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    ImGui::PopID();
     if (studio.activePreviewTexture.IsValid()) {
-        ImGui::Image((ImTextureID)studio.activePreviewTexture.GetSRV(), ImVec2(canvasW, canvasH));
-    } else {
-        ImGui::InvisibleButton("##CanvasInteractive", ImVec2(canvasW, canvasH));
+        drawList->AddImage((ImTextureID)studio.activePreviewTexture.GetSRV(), p0, p1);
     }
 
     bool canvasHovered = ImGui::IsItemHovered();
@@ -234,16 +231,17 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
     ImVec2 mousePos = ImGui::GetIO().MousePos;
     int hoverPx = (int)((mousePos.x - p0.x) / pZoom);
     int hoverPy = (int)((mousePos.y - p0.y) / pZoom);
-    bool inBounds = (hoverPx >= 0 && hoverPx < (int)spec.width && hoverPy >= 0 && hoverPy < (int)spec.height);
+    bool inBounds = mousePos.x >= p0.x && mousePos.y >= p0.y && mousePos.x < p1.x && mousePos.y < p1.y;
 
     // Mouse Interaction
-    if ((canvasActive && lmbDown) || (canvasHovered && rmbDown)) {
+    if (canvasActive && (lmbDown || rmbDown)) {
         if (inBounds) {
             // Eyedropper Tool
             if (studio.activePixelTool == StudioState::PixelTool::Eyedropper && lmbDown) {
                 uint32_t px = activeRgba[hoverPy * spec.width + hoverPx];
                 Rgb8 sampled((uint8_t)(px & 0xFF), (uint8_t)((px >> 8) & 0xFF), (uint8_t)((px >> 16) & 0xFF));
-                studio.assetColorOverrides[spec.id] = sampled;
+                studio.PushUndo(std::string(Tr(i18n::Str::ToolEyedropper)) + ": " + spec.id);
+                studio.SetAssetPaintColor(spec.id, sampled);
                 strncpy_s(studio.assetHexEditBuf, sampled.ToHex().c_str(), sizeof(studio.assetHexEditBuf));
                 studio.activePixelTool = StudioState::PixelTool::Pencil;
                 studio.textureNeedsUpdate = true;
@@ -260,7 +258,7 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
                     FloodFillRgb(editRgba, spec.width, spec.height, hoverPx, hoverPy, targetCol, fillCol);
                     std::vector<uint8_t> newRaw;
                     if (FirmwareBitmap::EncodeRgb565(editRgba.data(), spec.width, spec.height, newRaw)) {
-                        studio.replacements[spec.id] = std::move(newRaw);
+                        studio.SetBitmapReplacement(catIdx, std::move(newRaw));
                     }
                 } else {
                     std::vector<uint8_t> editGray;
@@ -270,7 +268,7 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
                     FloodFillMask(editGray, spec.width, spec.height, hoverPx, hoverPy, targetVal, fillVal);
                     std::vector<uint8_t> newRaw;
                     if (FirmwareBitmap::EncodeMaskPreserving(editGray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
-                        studio.replacements[spec.id] = std::move(newRaw);
+                        studio.SetBitmapReplacement(catIdx, std::move(newRaw));
                     }
                 }
                 studio.textureNeedsUpdate = true;
@@ -313,7 +311,7 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
                     if (changed) {
                         std::vector<uint8_t> newRaw;
                         if (FirmwareBitmap::EncodeRgb565(editRgba.data(), spec.width, spec.height, newRaw)) {
-                            studio.replacements[spec.id] = std::move(newRaw);
+                            studio.SetBitmapReplacement(catIdx, std::move(newRaw));
                             studio.textureNeedsUpdate = true;
                         }
                     }
@@ -339,7 +337,7 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
                     if (changed) {
                         std::vector<uint8_t> newRaw;
                         if (FirmwareBitmap::EncodeMaskPreserving(editGray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
-                            studio.replacements[spec.id] = std::move(newRaw);
+                            studio.SetBitmapReplacement(catIdx, std::move(newRaw));
                             studio.textureNeedsUpdate = true;
                         }
                     }
@@ -347,6 +345,7 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
             }
         }
     } else {
+        if (studio.isPixelStrokeActive) studio.EndUndoAction();
         studio.isPixelStrokeActive = false;
     }
 

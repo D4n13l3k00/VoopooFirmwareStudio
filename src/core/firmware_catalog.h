@@ -1,4 +1,5 @@
 #pragma once
+#include "firmware_color.h"
 
 #include <string>
 #include <vector>
@@ -27,5 +28,9 @@ struct AssetSpec {
     }
 };
 
-const char* PaletteIdForAsset(const AssetSpec& spec);
+const char* PaletteIdForAsset(const AssetSpec& spec, size_t previewRank = 0, bool cyanMode = false);
+Rgb8 FixedForegroundForAsset(const AssetSpec& spec);
+bool AssetUsesModeColor(const AssetSpec& spec);
+class FirmwarePackage;
+Rgb8 FirmwareFixedForeground(const FirmwarePackage& fw, const AssetSpec& spec, size_t previewRank);
 std::vector<AssetSpec> GetAllAssets();

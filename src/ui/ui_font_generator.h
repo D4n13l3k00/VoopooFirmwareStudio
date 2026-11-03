@@ -1,6 +1,5 @@
 #pragma once
 
-#if STUDIO_FONTS
 
 #include "app_state.h"
 #include "font_renderer.h"
@@ -34,6 +33,3 @@ namespace UiFontGenerator {
 void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smokeTest, int debugFrame);
 
 } // namespace UiFontGenerator
-
-#endif // STUDIO_FONTS
-
