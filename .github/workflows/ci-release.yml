@@ -85,6 +85,9 @@ jobs:
       - name: Read release notes from annotated tag
         shell: bash
         run: |
+          # Checkout can replace the local tag object with its peeled commit.
+          git fetch --force origin "$GITHUB_REF:$GITHUB_REF"
+          test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$GITHUB_SHA"
           if [ "$(git cat-file -t "$GITHUB_REF")" != tag ]; then
             echo "Release requires an annotated tag containing release notes." >&2
             exit 1
