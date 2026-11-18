@@ -5,6 +5,7 @@
 #include <string>
 #include <map>
 #include <memory>
+#include <functional>
 #include "firmware_color.h"
 
 struct HardwareRecord {
@@ -23,6 +24,7 @@ struct BuildReport {
     size_t records = 0;
     size_t changed_assets = 0;
     size_t changed_colors = 0;
+    size_t changed_layout_elements = 0;
     size_t patched_ranges = 0;
     size_t unchanged_payload_bytes_verified = 0;
     std::vector<std::string> hardware_codes;
@@ -37,14 +39,24 @@ struct CodePatch {
     std::vector<std::vector<size_t>> locations;
 };
 
+enum class FirmwareFormat {
+    Zwdf,
+    Xwdf,
+    Swdf,
+    ZwdfStartEnd
+};
+
 class FirmwarePackage {
 public:
+    FirmwareFormat format = FirmwareFormat::Zwdf;
     std::vector<HardwareRecord> records;
     std::vector<uint8_t> source_bytes;
     std::string source_sha256;
 
-    static bool Open(const std::string& path, FirmwarePackage& out_pkg, std::string& out_err);
-    static bool Parse(const std::vector<uint8_t>& bytes, FirmwarePackage& out_pkg, std::string& out_err);
+    static bool Open(const std::string& path, FirmwarePackage& out_pkg, std::string& out_err,
+                     const std::function<void(const char*)>& progress = {});
+    static bool Parse(const std::vector<uint8_t>& bytes, FirmwarePackage& out_pkg, std::string& out_err,
+                      const std::function<void(const char*)>& progress = {});
 
     const uint8_t* BytesAt(size_t record_idx, uint32_t address, size_t len) const;
     bool FindUnique(size_t record_idx, const uint8_t* needle, size_t needle_len, size_t& out_offset) const;
@@ -55,7 +67,8 @@ public:
         const std::vector<CodePatch>& code_patches,
         std::vector<uint8_t>& out_bytes,
         BuildReport& out_report,
-        std::string& out_err
+        std::string& out_err,
+        const std::function<void(const char*)>& progress = {}
     ) const;
 
     static uint16_t Crc16Ccitt(const uint8_t* data, size_t len);
@@ -75,4 +88,11 @@ bool DetectFirmwareColors(
     const FirmwarePackage& fw,
     std::vector<PaletteState>& palette,
     Rgb8& background
+);
+
+bool FirmwareRecordPaletteColor(
+    const FirmwarePackage& fw,
+    uint16_t deviceCode,
+    const char* roleId,
+    Rgb8& color
 );

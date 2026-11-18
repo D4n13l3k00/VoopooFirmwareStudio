@@ -1,3 +1,4 @@
+#include "ui_tabs.h"
 #include "ui_firmware_info.h"
 #include "i18n.h"
 #include "../imgui/imgui.h"
@@ -7,12 +8,14 @@ namespace UiFirmwareInfo {
 void RenderTab(StudioState& studio) {
     char _tb[128];
     snprintf(_tb, sizeof(_tb), "%s###TabFwInfo", Tr(i18n::Str::TabFirmwareInfo));
-    if (ImGui::BeginTabItem(_tb)) {
-        ImGui::SeparatorText(Tr(i18n::Str::FwInfoSpecTitle));
-
+    if (Ui::BeginTabItem(_tb)) {
         if (!studio.hasFirmware) {
             ImGui::TextDisabled("%s", Tr(i18n::Str::FwInfoNoFirmware));
         } else {
+            ImGui::Text("%s %s", FirmwareModelName(studio.model), FirmwareEditionName(studio.edition));
+            ImGui::SameLine();
+            ImGui::TextUnformatted(studio.firmware.format == FirmwareFormat::Xwdf ? "XWDF" :
+                studio.firmware.format == FirmwareFormat::Swdf ? "SWDF" : "ZWDF");
             std::string displayFwPath = studio.firmwarePath;
             if (studio.isBuiltin) {
                 displayFwPath += " (";
@@ -45,10 +48,14 @@ void RenderTab(StudioState& studio) {
                     ImGui::Text("%zu", r);
 
                     ImGui::TableSetColumnIndex(1);
-                    ImGui::Text("%02X%02X", rec.device_code[0], rec.device_code[1]);
+                    if (studio.firmware.format == FirmwareFormat::Xwdf)
+                        ImGui::Text("%.*s", static_cast<int>(rec.marker.size()), rec.marker.data());
+                    else
+                        ImGui::Text("%02X%02X", rec.device_code[0], rec.device_code[1]);
 
                     ImGui::TableSetColumnIndex(2);
-                    ImGui::Text("%zu B", rec.image.size() + 2);
+                    if (studio.firmware.format == FirmwareFormat::Xwdf) ImGui::TextUnformatted("—");
+                    else ImGui::Text("%zu B", rec.image.size() + 2);
 
                     ImGui::TableSetColumnIndex(3);
                     ImGui::Text("%zu B", rec.image.size());
@@ -65,9 +72,6 @@ void RenderTab(StudioState& studio) {
                 ImGui::EndTable();
             }
 
-            ImGui::Spacing();
-            ImGui::SeparatorText(Tr(i18n::Str::FwInfoInstructionsTitle));
-            ImGui::BulletText("%s", Tr(i18n::Str::FwInfoBulletBuildZwdf));
         }
 
         ImGui::EndTabItem();

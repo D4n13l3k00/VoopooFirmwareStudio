@@ -9,8 +9,300 @@
 
 #include <cmath>
 #include <algorithm>
+#include <array>
+#include <map>
+#include <wincodec.h>
+#include <wrl/client.h>
+#pragma comment(lib, "windowscodecs.lib")
 
 namespace FirmwareBitmap {
+
+void ApplyAdjustments(std::vector<uint32_t>& pixels, int width, int height,
+                      const ImageAdjustments& adjustments) {
+    if (adjustments == ImageAdjustments{} || !adjustments.Valid() ||
+        width <= 0 || height <= 0 || pixels.size() != size_t(width) * height) return;
+    std::array<std::array<uint8_t, 256>, 3> tone{};
+    const float contrast = std::exp2(adjustments.contrast / 50.0f);
+    const float points[] = {0, adjustments.curve[0], adjustments.curve[1], adjustments.curve[2], 1};
+    constexpr std::array<float, 3> identity{0.25f, 0.5f, 0.75f};
+    std::array<std::array<float, 5>, 3> channelPoints{};
+    std::array<bool, 3> channelIdentity{};
+    for (size_t channel = 0; channel < tone.size(); ++channel) {
+        const auto& curve = adjustments.channelCurves[channel];
+        channelPoints[channel] = {0, curve[0], curve[1], curve[2], 1};
+        channelIdentity[channel] = curve == identity;
+    }
+    for (size_t i = 0; i < tone[0].size(); ++i) {
+        float value = (std::clamp)((float(i) / 255 - 0.5f) * contrast + 0.5f +
+            adjustments.brightness / 100, 0.0f, 1.0f);
+        value = std::pow(value, 1 / adjustments.gamma);
+        const int segment = (std::min)(int(value * 4), 3);
+        const float fraction = value * 4 - segment;
+        value = points[segment] + (points[segment + 1] - points[segment]) * fraction;
+        const int channelSegment = (std::min)(int(value * 4), 3);
+        const float channelFraction = value * 4 - channelSegment;
+        for (size_t channel = 0; channel < tone.size(); ++channel) {
+            const auto& points = channelPoints[channel];
+            // Identity channels retain the legacy master's exact rounding.
+            const float output = channelIdentity[channel] ? value :
+                points[channelSegment] + (points[channelSegment + 1] - points[channelSegment]) * channelFraction;
+            tone[channel][i] = uint8_t(std::lround(output * 255));
+        }
+    }
+    const float saturation = 1 + adjustments.saturation / 100;
+    for (auto& pixel : pixels) {
+        const float red = tone[0][pixel & 255], green = tone[1][(pixel >> 8) & 255], blue = tone[2][(pixel >> 16) & 255];
+        const float luminance = red * 0.2126f + green * 0.7152f + blue * 0.0722f;
+        auto channel = [&](float value) {
+            return uint32_t(std::lround((std::clamp)(luminance + (value - luminance) * saturation, 0.0f, 255.0f)));
+        };
+        pixel = (pixel & 0xff000000u) | channel(red) | channel(green) << 8 | channel(blue) << 16;
+    }
+    if (adjustments.sharpness != 0) {
+    const auto source = pixels;
+    const float strength = adjustments.sharpness / 100;
+    for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x) {
+            const size_t at = size_t(y) * width + x;
+            const size_t left = size_t(y) * width + (std::max)(x - 1, 0);
+            const size_t right = size_t(y) * width + (std::min)(x + 1, width - 1);
+            const size_t above = size_t((std::max)(y - 1, 0)) * width + x;
+            const size_t below = size_t((std::min)(y + 1, height - 1)) * width + x;
+            uint32_t result = source[at] & 0xff000000u;
+            for (unsigned shift : {0u, 8u, 16u}) {
+                const float center = float((source[at] >> shift) & 255);
+                const float average = float(((source[left] >> shift) & 255) + ((source[right] >> shift) & 255) +
+                    ((source[above] >> shift) & 255) + ((source[below] >> shift) & 255)) / 4;
+                const uint32_t value = uint32_t(std::lround((std::clamp)(center + (center - average) * strength, 0.0f, 255.0f)));
+                result |= value << shift;
+            }
+            pixels[at] = result;
+        }
+    }
+    if (!adjustments.paletteColors) return;
+    struct Color { uint32_t rgb, count; };
+    std::map<uint32_t, uint32_t> histogram;
+    for (const auto pixel : pixels) ++histogram[pixel & 0xffffff];
+    if (histogram.size() <= adjustments.paletteColors) return;
+    std::vector<Color> colors;
+    colors.reserve(histogram.size());
+    for (const auto& [rgb, count] : histogram) colors.push_back({rgb, count});
+    struct Box { size_t begin, end; };
+    std::vector<Box> boxes{{0, colors.size()}};
+    while (boxes.size() < adjustments.paletteColors) {
+        size_t best = boxes.size();
+        unsigned axis = 0;
+        uint64_t score = 0;
+        for (size_t box = 0; box < boxes.size(); ++box) {
+            const auto [begin, end] = boxes[box];
+            if (end - begin < 2) continue;
+            uint32_t total = 0;
+            unsigned minimum[3] = {255, 255, 255}, maximum[3]{};
+            for (size_t i = begin; i < end; ++i) {
+                total += colors[i].count;
+                for (unsigned channel = 0; channel < 3; ++channel) {
+                    const unsigned value = (colors[i].rgb >> (channel * 8)) & 255;
+                    minimum[channel] = (std::min)(minimum[channel], value);
+                    maximum[channel] = (std::max)(maximum[channel], value);
+                }
+            }
+            for (unsigned channel = 0; channel < 3; ++channel) {
+                const uint64_t candidate = uint64_t(maximum[channel] - minimum[channel]) * total;
+                if (candidate > score) { score = candidate; best = box; axis = channel * 8; }
+            }
+        }
+        if (best == boxes.size()) break;
+        const auto [begin, end] = boxes[best];
+        std::sort(colors.begin() + begin, colors.begin() + end, [axis](const Color& a, const Color& b) {
+            const auto left = (a.rgb >> axis) & 255, right = (b.rgb >> axis) & 255;
+            return left != right ? left < right : a.rgb < b.rgb;
+        });
+        uint32_t total = 0, accumulated = 0;
+        for (size_t i = begin; i < end; ++i) total += colors[i].count;
+        size_t middle = begin;
+        do { accumulated += colors[middle++].count; } while (middle < end - 1 && accumulated < total / 2);
+        boxes[best].end = middle;
+        boxes.push_back({middle, end});
+    }
+    std::vector<uint32_t> palette;
+    for (const auto [begin, end] : boxes) {
+        uint64_t sums[3]{}, total = 0;
+        for (size_t i = begin; i < end; ++i) {
+            total += colors[i].count;
+            for (unsigned c = 0; c < 3; ++c) sums[c] += uint64_t((colors[i].rgb >> (c * 8)) & 255) * colors[i].count;
+        }
+        palette.push_back(uint32_t(sums[0] / total) | uint32_t(sums[1] / total) << 8 | uint32_t(sums[2] / total) << 16);
+    }
+    for (auto& [rgb, replacement] : histogram) {
+        uint32_t distance = UINT32_MAX;
+        for (const auto candidate : palette) {
+            uint32_t current = 0;
+            for (unsigned shift : {0u, 8u, 16u}) {
+                const int difference = int((rgb >> shift) & 255) - int((candidate >> shift) & 255);
+                current += difference * difference;
+            }
+            if (current < distance) { distance = current; replacement = candidate; }
+        }
+    }
+    for (auto& pixel : pixels) pixel = (pixel & 0xff000000u) | histogram.find(pixel & 0xffffff)->second;
+}
+
+bool LoadImageRgba(const std::string& path, std::vector<uint8_t>& rgba,
+                   int& width, int& height, std::string& error) {
+    constexpr uint64_t MaximumPixels = 32 * 1024 * 1024;
+    const auto valid = [](uint64_t w, uint64_t h) {
+        return w && h && w <= 32768 && h <= 32768 && w * h <= MaximumPixels;
+    };
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    struct ComScope { bool owned; ~ComScope() { if (owned) CoUninitialize(); } } com{SUCCEEDED(initialized)};
+    using Microsoft::WRL::ComPtr;
+    ComPtr<IWICImagingFactory> factory;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICFormatConverter> converter;
+    std::vector<uint8_t> decoded;
+    int w = 0, h = 0;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->CreateDecoderFromFilename(PathUtils::Utf8ToWide(path).c_str(), nullptr, GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand, &decoder)) &&
+        SUCCEEDED(decoder->GetFrame(0, &frame))) {
+        UINT fw = 0, fh = 0;
+        if (SUCCEEDED(frame->GetSize(&fw, &fh)) && valid(fw, fh)) {
+            ComPtr<IWICBitmapSource> source = frame;
+            ComPtr<IWICBitmapFlipRotator> rotated;
+            ComPtr<IWICMetadataQueryReader> metadata;
+            PROPVARIANT orientation{};
+            if (SUCCEEDED(frame->GetMetadataQueryReader(&metadata))) {
+                HRESULT hr = metadata->GetMetadataByName(L"/app1/ifd/{ushort=274}", &orientation);
+                if (FAILED(hr)) hr = metadata->GetMetadataByName(L"/ifd/{ushort=274}", &orientation);
+                if (SUCCEEDED(hr) && orientation.vt == VT_UI2 && orientation.uiVal >= 2 && orientation.uiVal <= 8) {
+                    constexpr WICBitmapTransformOptions transforms[] = {
+                        WICBitmapTransformRotate0, WICBitmapTransformFlipHorizontal,
+                        WICBitmapTransformRotate180, WICBitmapTransformFlipVertical,
+                        WICBitmapTransformOptions(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal),
+                        WICBitmapTransformRotate90,
+                        WICBitmapTransformOptions(WICBitmapTransformRotate270 | WICBitmapTransformFlipHorizontal),
+                        WICBitmapTransformRotate270};
+                    if (SUCCEEDED(factory->CreateBitmapFlipRotator(&rotated)) &&
+                        SUCCEEDED(rotated->Initialize(frame.Get(), transforms[orientation.uiVal - 1])))
+                        source = rotated;
+                }
+                PropVariantClear(&orientation);
+            }
+            if (SUCCEEDED(source->GetSize(&fw, &fh)) &&
+                SUCCEEDED(factory->CreateFormatConverter(&converter)) &&
+                SUCCEEDED(converter->Initialize(source.Get(), GUID_WICPixelFormat32bppRGBA,
+                    WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom))) {
+                decoded.resize(size_t(fw) * fh * 4);
+                if (SUCCEEDED(converter->CopyPixels(nullptr, fw * 4, static_cast<UINT>(decoded.size()), decoded.data()))) {
+                    w = int(fw); h = int(fh);
+                }
+            }
+        }
+    }
+    if (!w) {
+        FILE* file = PathUtils::FopenUtf8(path, L"rb");
+        int channels = 0;
+        if (!file) { error = "Cannot open image"; return false; }
+        const bool dimensions = stbi_info_from_file(file, &w, &h, &channels) && valid(w, h);
+        rewind(file);
+        stbi_uc* pixels = dimensions ? stbi_load_from_file(file, &w, &h, &channels, 4) : nullptr;
+        fclose(file);
+        if (!pixels) {
+            error = dimensions ? "Cannot decode image" : "Unsupported image or image exceeds 32 megapixels / 32768 pixels per side";
+            return false;
+        }
+        decoded.assign(pixels, pixels + size_t(w) * h * 4);
+        stbi_image_free(pixels);
+    }
+    rgba = std::move(decoded); width = w; height = h; error.clear();
+    return true;
+}
+
+namespace {
+struct SampleWeight { int index; float weight; };
+using Weights = std::vector<std::vector<SampleWeight>>;
+double Kernel(double x, Resampling filter) {
+    x = std::abs(x);
+    if (filter == Resampling::Bilinear) return (std::max)(0.0, 1.0 - x);
+    if (filter == Resampling::Bicubic)
+        return x < 1 ? (1.5 * x - 2.5) * x * x + 1 :
+            x < 2 ? ((-0.5 * x + 2.5) * x - 4) * x + 2 : 0;
+    if (x >= 3) return 0;
+    if (x < 1e-9) return 1;
+    constexpr double Pi = 3.14159265358979323846;
+    return std::sin(Pi * x) * std::sin(Pi * x / 3) / (Pi * Pi * x * x / 3);
+}
+Weights MakeWeights(int source, int destination, int firstPixel, int pixelCount, Resampling filter) {
+    Weights result(pixelCount);
+    const double reduction = (std::min)(1.0, double(destination) / source);
+    const double radius = (filter == Resampling::Bilinear ? 1 : filter == Resampling::Bicubic ? 2 : 3) / reduction;
+    for (int i = 0; i < pixelCount; ++i) {
+        const double center = (i + firstPixel + 0.5) * source / destination - 0.5;
+        auto& weights = result[i];
+        if (filter == Resampling::Nearest) {
+            weights.push_back({(std::clamp)(int(std::floor(center + 0.5)), 0, source - 1), 1});
+            continue;
+        }
+        const int first = int(std::ceil(center - radius)), last = int(std::floor(center + radius));
+        weights.reserve(last - first + 1);
+        double total = 0;
+        for (int j = first; j <= last; ++j) {
+            const float weight = float(Kernel((j - center) * reduction, filter));
+            if (!weight) continue;
+            const int index = (std::clamp)(j, 0, source - 1);
+            if (!weights.empty() && weights.back().index == index) weights.back().weight += weight;
+            else weights.push_back({index, weight});
+            total += weight;
+        }
+        for (auto& weight : weights) weight.weight = float(weight.weight / total);
+    }
+    return result;
+}
+}
+
+void ResizeRgbaOnBlack(const uint8_t* source, int width, int height,
+                       int outputWidth, int outputHeight, Resampling filter,
+                       std::vector<uint32_t>& output, int firstX, int firstY, int regionWidth, int regionHeight) {
+    if (!regionWidth) regionWidth = outputWidth;
+    if (!regionHeight) regionHeight = outputHeight;
+    if (!source || width <= 0 || height <= 0 || outputWidth <= 0 || outputHeight <= 0 ||
+        firstX < 0 || firstY < 0 || regionWidth <= 0 || regionHeight <= 0 ||
+        regionWidth > outputWidth - firstX || regionHeight > outputHeight - firstY) { output.clear(); return; }
+    const auto wx = MakeWeights(width, outputWidth, firstX, regionWidth, filter);
+    const auto wy = MakeWeights(height, outputHeight, firstY, regionHeight, filter);
+    // Choose the smaller intermediate, including extremely tall/wide inputs.
+    const bool horizontal = int64_t(regionWidth) * height <= int64_t(width) * regionHeight;
+    const int intermediateWidth = horizontal ? regionWidth : width;
+    const int intermediateHeight = horizontal ? height : regionHeight;
+    std::vector<std::array<float, 3>> intermediate(size_t(intermediateWidth) * intermediateHeight);
+    for (int y = 0; y < intermediateHeight; ++y) {
+        for (int x = 0; x < intermediateWidth; ++x) {
+            auto& pixel = intermediate[size_t(y) * intermediateWidth + x];
+            const auto& weights = horizontal ? wx[x] : wy[y];
+            for (const auto& weight : weights) {
+                const auto* sample = source + (horizontal ? size_t(y) * width + weight.index : size_t(weight.index) * width + x) * 4;
+                const float alphaWeight = weight.weight * (sample[3] / 255.0f);
+                for (unsigned c = 0; c < 3; ++c) pixel[c] += sample[c] * alphaWeight;
+            }
+        }
+    }
+    output.resize(size_t(regionWidth) * regionHeight);
+    for (int y = 0; y < regionHeight; ++y) {
+        for (int x = 0; x < regionWidth; ++x) {
+            float rgb[3]{};
+            const auto& weights = horizontal ? wy[y] : wx[x];
+            for (const auto& weight : weights) {
+                const auto& sample = intermediate[horizontal ? size_t(weight.index) * intermediateWidth + x :
+                    size_t(y) * intermediateWidth + weight.index];
+                for (unsigned c = 0; c < 3; ++c) rgb[c] += sample[c] * weight.weight;
+            }
+            uint32_t pixel = 0xff000000;
+            for (unsigned c = 0; c < 3; ++c) pixel |= uint32_t((std::clamp)(int(std::lround(rgb[c])), 0, 255)) << (c * 8);
+            output[size_t(y) * regionWidth + x] = pixel;
+        }
+    }
+}
 
 static stbi_uc* StbiLoadUtf8(const std::string& path, int* sw, int* sh, int* comp, int req_comp) {
     FILE* f = PathUtils::FopenUtf8(path, L"rb");
@@ -30,7 +322,18 @@ static int StbiWritePngUtf8(const std::string& path, int w, int h, int comp, con
     return res;
 }
 
-bool DecodeMask(const uint8_t* raw, size_t raw_len, uint32_t width, uint32_t height, std::vector<uint8_t>& out_gray) {
+bool DecodeMask(const uint8_t* raw, size_t raw_len, uint32_t width, uint32_t height,
+                std::vector<uint8_t>& out_gray, AssetFormat layout) {
+    if (layout == AssetFormat::Mask1BitPages) {
+        if (raw_len != static_cast<size_t>(width) * ((height + 7) / 8)) return false;
+        out_gray.assign(static_cast<size_t>(width) * height, 0);
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x)
+                out_gray[static_cast<size_t>(y) * width + x] =
+                    (raw[static_cast<size_t>(y / 8) * width + x] & (1u << (y & 7))) ? 255 : 0;
+        return true;
+    }
+    if (layout != AssetFormat::Mask1Bit) return false;
     size_t stride = (width + 7) / 8;
     if (raw_len != stride * height) {
         return false;
@@ -55,8 +358,23 @@ bool EncodeMaskPreserving(
     uint32_t height,
     const uint8_t* original_raw,
     size_t raw_len,
-    std::vector<uint8_t>& out_raw
+    std::vector<uint8_t>& out_raw,
+    AssetFormat layout
 ) {
+    if (layout == AssetFormat::Mask1BitPages) {
+        if (raw_len != static_cast<size_t>(width) * ((height + 7) / 8)) return false;
+        out_raw.assign(original_raw, original_raw + raw_len);
+        for (uint32_t y = 0; y < height; ++y) {
+            const auto mask = static_cast<uint8_t>(1u << (y & 7));
+            for (uint32_t x = 0; x < width; ++x) {
+                auto& byte = out_raw[static_cast<size_t>(y / 8) * width + x];
+                if (gray_pixels[static_cast<size_t>(y) * width + x] >= 128) byte |= mask;
+                else byte &= static_cast<uint8_t>(~mask);
+            }
+        }
+        return true;
+    }
+    if (layout != AssetFormat::Mask1Bit) return false;
     size_t stride = (width + 7) / 8;
     if (raw_len != stride * height) {
         return false;

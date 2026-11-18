@@ -1,9 +1,11 @@
+#include "ui_tabs.h"
 
 #include "ui_font_generator.h"
 #include "path_utils.h"
 #include "i18n.h"
 #include "firmware_bitmap.h"
 #include "../imgui/imgui.h"
+#include "ui_controls.h"
 
 #include <windows.h>
 #include <shellapi.h>
@@ -13,13 +15,14 @@
 namespace fs = std::filesystem;
 
 void FontGenState::Init() {
-    popularFonts = FontRenderer::ListPopularWindowsFonts();
-    selectedFontIdx = 0;
+    installedFonts = FontRenderer::ListInstalledFonts(fontCatalogError);
+    const auto preferred = std::find_if(installedFonts.begin(), installedFonts.end(),
+        [](const SystemFont& font) { return !font.userInstalled && font.name == "Impact"; });
+    selectedFontIdx = preferred == installedFonts.end() ? 0 : static_cast<int>(preferred - installedFonts.begin());
     fontDisplayName = "None";
-    if (!popularFonts.empty()) {
-        if (fontRenderer.LoadFontFile(popularFonts[0].path)) {
-            fontDisplayName = popularFonts[0].name;
-        }
+    if (!installedFonts.empty()) {
+        const auto& font = installedFonts[selectedFontIdx];
+        if (fontRenderer.LoadFontFile(font.path, font.faceIndex)) fontDisplayName = font.name;
     }
 
     presets = Preset::all();
@@ -32,7 +35,6 @@ void FontGenState::Init() {
     fontOpts.padding_x = 0;
     fontOpts.padding_y = 0;
 
-    fontZoom = 6;
     fontShowGrid = true;
     fontExportAll = false;
     fontDirty = true;
@@ -41,6 +43,14 @@ void FontGenState::Init() {
 namespace UiFontGenerator {
 
 void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smokeTest, int debugFrame) {
+    if (fontState.presetModel != studio.model || fontState.presetEdition != studio.edition) {
+        fontState.presets = Preset::all(studio.model, studio.edition);
+        fontState.presetModel = studio.model;
+        fontState.presetEdition = studio.edition;
+        fontState.selectedPresetIdx = 0;
+        fontState.fontPreviewGlyphs.clear();
+        fontState.fontDirty = true;
+    }
     if (fontState.fontDirty) {
         fontState.fontDirty = false;
         if (fontState.fontRenderer.IsLoaded() && fontState.selectedPresetIdx < (int)fontState.presets.size()) {
@@ -55,30 +65,44 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
 
     char _tb[128];
     snprintf(_tb, sizeof(_tb), "%s###TabFontGen", Tr(i18n::Str::TabFontGenerator));
-    if (ImGui::BeginTabItem(_tb, nullptr, smokeTest && debugFrame == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
+    if (Ui::BeginTabItem(_tb, nullptr, smokeTest && debugFrame == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
         // Left Font Controls (width 390px)
         ImGui::BeginChild("FontControlsPanel", ImVec2(390.0f, 0.0f), true);
         {
             ImGui::SeparatorText(Tr(i18n::Str::FontSec1Title));
 
-            if (!fontState.popularFonts.empty()) {
-                if (ImGui::BeginCombo(Tr(i18n::Str::FontSec1WindowsFont), fontState.popularFonts[fontState.selectedFontIdx].name.c_str())) {
-                    for (int i = 0; i < (int)fontState.popularFonts.size(); ++i) {
-                        bool is_selected = (fontState.selectedFontIdx == i);
-                        if (ImGui::Selectable(fontState.popularFonts[i].name.c_str(), is_selected)) {
+            if (!fontState.fontCatalogError.empty())
+                ImGui::TextWrapped("%s", fontState.fontCatalogError.c_str());
+            if (!fontState.installedFonts.empty() && Ui::BeginControlTable("FontSelection")) {
+                Ui::ControlRow(Tr(i18n::Str::FontSec1WindowsFont));
+                if (ImGui::BeginCombo("##WindowsFont",
+                    fontState.installedFonts[fontState.selectedFontIdx].name.c_str())) {
+                    bool first = true, previousUser = false;
+                    for (int i = 0; i < static_cast<int>(fontState.installedFonts.size()); ++i) {
+                        const auto& font = fontState.installedFonts[i];
+                        if (first || previousUser != font.userInstalled) {
+                            ImGui::SeparatorText(Tr(font.userInstalled ? i18n::Str::FontUserFonts : i18n::Str::FontSystemFonts));
+                            first = false;
+                            previousUser = font.userInstalled;
+                        }
+                        ImGui::PushID(i);
+                        const bool selected = fontState.selectedFontIdx == i;
+                        if (ImGui::Selectable(font.name.c_str(), selected)) {
                             fontState.selectedFontIdx = i;
-                            if (fontState.fontRenderer.LoadFontFile(fontState.popularFonts[i].path)) {
-                                fontState.fontDisplayName = fontState.popularFonts[i].name;
+                            if (fontState.fontRenderer.LoadFontFile(font.path, font.faceIndex)) {
+                                fontState.fontDisplayName = font.name;
                                 fontState.fontDirty = true;
                             }
                         }
-                        if (is_selected) ImGui::SetItemDefaultFocus();
+                        if (selected) ImGui::SetItemDefaultFocus();
+                        ImGui::PopID();
                     }
                     ImGui::EndCombo();
                 }
+                ImGui::EndTable();
             }
 
-            if (ImGui::Button(Tr(i18n::Str::FontSec1BrowseTtf))) {
+            if (ImGui::Button(Tr(i18n::Str::FontSec1BrowseTtf), ImVec2(-1, 0))) {
                 std::string picked;
                 if (PathUtils::PickFileDialog(hwnd, L"Font Files (*.ttf;*.otf)\0*.ttf;*.otf\0All Files (*.*)\0*.*\0", picked)) {
                     if (fontState.fontRenderer.LoadFontFile(picked)) {
@@ -93,24 +117,28 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
             ImGui::Spacing();
             ImGui::SeparatorText(Tr(i18n::Str::FontSec2Title));
 
-            const char* presetNames[] = {
-                Tr(i18n::Str::FontPreset19x40),
-                Tr(i18n::Str::FontPreset11x20),
-                Tr(i18n::Str::FontPreset7x13),
-                Tr(i18n::Str::FontPreset6x10)
-            };
-
-            if (ImGui::Combo(Tr(i18n::Str::LabelFontPreset), &fontState.selectedPresetIdx, presetNames, IM_ARRAYSIZE(presetNames))) {
+            if (Ui::BeginControlTable("FontPresetSelection")) {
+            Ui::ControlRow(Tr(i18n::Str::LabelFontPreset));
+            if (ImGui::Combo("##FontPreset", &fontState.selectedPresetIdx,
+                [](void* data, int index) -> const char* {
+                    return (*static_cast<std::vector<Preset>*>(data))[index].name.c_str();
+                }, &fontState.presets, static_cast<int>(fontState.presets.size()))) {
                 fontState.fontDirty = true;
+            }
+            ImGui::EndTable();
             }
 
             ImGui::Spacing();
             ImGui::SeparatorText(Tr(i18n::Str::FontSec3Title));
 
+            if (Ui::BeginControlTable("FontThreshold")) {
+            Ui::ControlRow(Tr(i18n::Str::FontSec3Threshold));
             int th = fontState.fontOpts.threshold;
-            if (ImGui::SliderInt(Tr(i18n::Str::FontSec3Threshold), &th, 1, 254)) {
+            if (ImGui::SliderInt("##Threshold", &th, 1, 254)) {
                 fontState.fontOpts.threshold = (uint8_t)th;
                 fontState.fontDirty = true;
+            }
+            ImGui::EndTable();
             }
             ImGui::TextDisabled("%s", Tr(i18n::Str::FontSec3ThresholdHint));
 
@@ -122,16 +150,22 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
                 fontState.fontOpts.align_center = false;
                 fontState.fontDirty = true;
             }
-            ImGui::SameLine();
+            const float centerWidth = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
+                ImGui::CalcTextSize(Tr(i18n::Str::FontSec3CenterV)).x;
+            if (ImGui::GetItemRectSize().x + ImGui::GetStyle().ItemSpacing.x + centerWidth <=
+                ImGui::GetContentRegionAvail().x) ImGui::SameLine();
             if (ImGui::RadioButton(Tr(i18n::Str::FontSec3CenterV), fontState.fontOpts.align_center)) {
                 fontState.fontOpts.align_center = true;
                 fontState.fontDirty = true;
             }
 
-            if (ImGui::SliderInt(Tr(i18n::Str::FontSec3PaddingX), &fontState.fontOpts.padding_x, 0, 5)) {
+            if (Ui::BeginControlTable("FontRenderParameters")) {
+            Ui::ControlRow(Tr(i18n::Str::FontSec3PaddingX));
+            if (ImGui::SliderInt("##PaddingX", &fontState.fontOpts.padding_x, 0, 5)) {
                 fontState.fontDirty = true;
             }
-            if (ImGui::SliderInt(Tr(i18n::Str::FontSec3PaddingY), &fontState.fontOpts.padding_y, 0, 5)) {
+            Ui::ControlRow(Tr(i18n::Str::FontSec3PaddingY));
+            if (ImGui::SliderInt("##PaddingY", &fontState.fontOpts.padding_y, 0, 5)) {
                 fontState.fontDirty = true;
             }
 
@@ -142,9 +176,12 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
                 Tr(i18n::Str::FontOs8x)
             };
             int osIdx = (fontState.fontOpts.oversample == 1) ? 0 : (fontState.fontOpts.oversample == 2) ? 1 : (fontState.fontOpts.oversample == 4) ? 2 : 3;
-            if (ImGui::Combo(Tr(i18n::Str::FontSec3Oversampling), &osIdx, osNames, IM_ARRAYSIZE(osNames))) {
+            Ui::ControlRow(Tr(i18n::Str::FontSec3Oversampling));
+            if (ImGui::Combo("##Oversampling", &osIdx, osNames, IM_ARRAYSIZE(osNames))) {
                 fontState.fontOpts.oversample = (osIdx == 0) ? 1 : (osIdx == 1) ? 2 : (osIdx == 2) ? 4 : 8;
                 fontState.fontDirty = true;
+            }
+            ImGui::EndTable();
             }
 
             ImGui::Spacing();
@@ -154,7 +191,7 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.55f, 0.25f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.70f, 0.32f, 1.0f));
 
-            if (ImGui::Button(Tr(i18n::Str::FontSec4ApplyPreset), ImVec2(-1, 32))) {
+            if (ImGui::Button(Tr(i18n::Str::FontSec4ApplyPreset), ImVec2(-1, 0))) {
                 if (!fontState.fontRenderer.IsLoaded()) {
                     studio.statusMsg = Tr(i18n::Str::MsgFontNotLoaded);
                     studio.statusIsErr = true;
@@ -171,7 +208,7 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
                             if (studio.catalog[i].id == assetId) {
                                 const auto& spec = studio.catalog[i];
                                 std::vector<uint8_t> newRaw;
-                                if (FirmwareBitmap::EncodeMaskPreserving(g.pixels.data(), spec.width, spec.height, studio.originals[i].data(), spec.byte_len(), newRaw)) {
+                                if (FirmwareBitmap::EncodeMaskPreserving(g.pixels.data(), spec.width, spec.height, studio.originals[i].data(), spec.byte_len(), newRaw, spec.format)) {
                                     studio.SetBitmapReplacement(i, std::move(newRaw));
                                     stagedCount++;
                                 }
@@ -190,7 +227,7 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
             // Batch Inject All 4 Font Presets Button
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.45f, 0.65f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.58f, 0.82f, 1.0f));
-            if (ImGui::Button(Tr(i18n::Str::FontSec4ApplyAll), ImVec2(-1, 34))) {
+            if (ImGui::Button(Tr(i18n::Str::FontSec4ApplyAll), ImVec2(-1, 0))) {
                 if (!fontState.fontRenderer.IsLoaded()) {
                     studio.statusMsg = Tr(i18n::Str::MsgFontNotLoaded);
                     studio.statusIsErr = true;
@@ -208,7 +245,7 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
                             if (catIdx >= 0) {
                                 const auto& spec = studio.catalog[catIdx];
                                 std::vector<uint8_t> newRaw;
-                                if (FirmwareBitmap::EncodeMaskPreserving(g.pixels.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
+                                if (FirmwareBitmap::EncodeMaskPreserving(g.pixels.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw, spec.format)) {
                                     studio.SetBitmapReplacement(catIdx, std::move(newRaw));
                                     totalStaged++;
                                 }
@@ -227,23 +264,28 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
             ImGui::Spacing();
             ImGui::SeparatorText(Tr(i18n::Str::FontSec5Title));
 
-            ImGui::InputText(Tr(i18n::Str::FontSec5OutputFolder), fontState.fontOutDirBuf, sizeof(fontState.fontOutDirBuf));
+            if (Ui::BeginControlTable("FontOutput")) {
+                Ui::ControlRow(Tr(i18n::Str::FontSec5OutputFolder));
+                ImGui::InputText("##OutputFolder", fontState.fontOutDirBuf, sizeof(fontState.fontOutDirBuf));
+                ImGui::EndTable();
+            }
 
-            if (ImGui::Button(Tr(i18n::Str::FontSec5BrowseFolder))) {
+            const float folderWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+            if (ImGui::Button(Tr(i18n::Str::FontSec5BrowseFolder), ImVec2(folderWidth, 0))) {
                 std::string picked;
                 if (PathUtils::PickFolderDialog(hwnd, picked)) {
                     strcpy_s(fontState.fontOutDirBuf, picked.c_str());
                 }
             }
             ImGui::SameLine();
-            if (ImGui::Button(Tr(i18n::Str::FontSec5OpenExplorer))) {
+            if (ImGui::Button(Tr(i18n::Str::FontSec5OpenExplorer), ImVec2(folderWidth, 0))) {
                 std::wstring wOut = PathUtils::Utf8ToWide(fontState.fontOutDirBuf);
                 ShellExecuteW(nullptr, L"open", wOut.c_str(), nullptr, nullptr, SW_SHOWDEFAULT);
             }
 
             ImGui::Checkbox(Tr(i18n::Str::FontSec5ExportAllPreset), &fontState.fontExportAll);
 
-            if (ImGui::Button(Tr(i18n::Str::FontSec5ExportButton), ImVec2(-1, 30))) {
+            if (ImGui::Button(Tr(i18n::Str::FontSec5ExportButton), ImVec2(-1, 0))) {
                 if (!fontState.fontRenderer.IsLoaded()) {
                     studio.statusMsg = Tr(i18n::Str::MsgFontNotLoaded);
                     studio.statusIsErr = true;
@@ -303,9 +345,12 @@ void RenderTab(StudioState& studio, FontGenState& fontState, HWND hwnd, bool smo
         {
             ImGui::SeparatorText(Tr(i18n::Str::FontRightLivePreview));
 
-            ImGui::SetNextItemWidth(140.0f);
-            ImGui::SliderInt(Tr(i18n::Str::LabelZoom), &fontState.fontZoom, 2, 12);
-            ImGui::SameLine();
+            if (Ui::BeginControlTable("FontPreviewControls",
+                (std::min)(ImGui::GetContentRegionAvail().x, ImGui::GetFontSize() * 30))) {
+                Ui::ControlRow(Tr(i18n::Str::LabelZoom));
+                Ui::ZoomSlider("##Zoom", fontState.fontZoom);
+                ImGui::EndTable();
+            }
             ImGui::Checkbox(Tr(i18n::Str::LabelFontPixelGrid), &fontState.fontShowGrid);
             ImGui::SameLine();
 

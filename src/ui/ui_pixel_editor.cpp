@@ -67,9 +67,19 @@ static void FloodFillRgb(std::vector<uint32_t>& rgba, int width, int height, int
 
 void RenderToolbar(StudioState& studio, size_t catIdx) {
     const auto& spec = studio.catalog[catIdx];
+    const auto& style = ImGui::GetStyle();
+    const float right = ImGui::GetWindowPos().x + ImGui::GetWindowWidth() -
+        style.WindowPadding.x - style.ScrollbarSize - ImGui::GetScrollX();
+    const auto nextItem = [&](float width) {
+        if (ImGui::GetItemRectMax().x + style.ItemSpacing.x + width <= right)
+            ImGui::SameLine();
+    };
+    const auto nextButton = [&](i18n::Str label) {
+        nextItem(ImGui::CalcTextSize(Tr(label)).x + style.FramePadding.x * 2);
+    };
 
-    ImGui::TextDisabled("Tools:");
-    ImGui::SameLine();
+    ImGui::TextDisabled("%s", Tr(i18n::Str::LabelPixelTools));
+    nextButton(i18n::Str::ToolPencil);
 
     // Pencil
     bool isPencil = (studio.activePixelTool == StudioState::PixelTool::Pencil);
@@ -79,7 +89,7 @@ void RenderToolbar(StudioState& studio, size_t catIdx) {
     }
     if (isPencil) ImGui::PopStyleColor();
 
-    ImGui::SameLine();
+    nextButton(i18n::Str::ToolEraser);
     // Eraser
     bool isEraser = (studio.activePixelTool == StudioState::PixelTool::Eraser);
     if (isEraser) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.35f, 0.2f, 1.0f));
@@ -88,7 +98,7 @@ void RenderToolbar(StudioState& studio, size_t catIdx) {
     }
     if (isEraser) ImGui::PopStyleColor();
 
-    ImGui::SameLine();
+    nextButton(i18n::Str::ToolEyedropper);
     // Eyedropper
     bool isEye = (studio.activePixelTool == StudioState::PixelTool::Eyedropper);
     if (isEye) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.4f, 1.0f));
@@ -97,7 +107,7 @@ void RenderToolbar(StudioState& studio, size_t catIdx) {
     }
     if (isEye) ImGui::PopStyleColor();
 
-    ImGui::SameLine();
+    nextButton(i18n::Str::ToolBucketFill);
     // Bucket Fill
     bool isFill = (studio.activePixelTool == StudioState::PixelTool::BucketFill);
     if (isFill) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.3f, 0.7f, 1.0f));
@@ -106,27 +116,16 @@ void RenderToolbar(StudioState& studio, size_t catIdx) {
     }
     if (isFill) ImGui::PopStyleColor();
 
-    ImGui::SameLine();
-    ImGui::TextUnformatted("|");
-    ImGui::SameLine();
-
-    // Brush Size selection: 1px, 2px, 3px, 4px
+    nextItem(ImGui::CalcTextSize(Tr(i18n::Str::LabelBrushSize)).x + style.ItemSpacing.x + 135);
+    ImGui::BeginGroup();
+    ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(Tr(i18n::Str::LabelBrushSize));
     ImGui::SameLine();
-    for (int sz = 1; sz <= 4; ++sz) {
-        char szBuf[16];
-        snprintf(szBuf, sizeof(szBuf), "%dpx", sz);
-        bool isCurSz = (studio.brushSize == sz);
-        if (isCurSz) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.5f, 0.7f, 1.0f));
-        if (ImGui::Button(szBuf)) {
-            studio.brushSize = sz;
-        }
-        if (isCurSz) ImGui::PopStyleColor();
-        ImGui::SameLine();
-    }
-
-    ImGui::TextUnformatted("|");
-    ImGui::SameLine();
+    ImGui::SetNextItemWidth(135);
+    ImGui::SliderInt("##BrushSize", &studio.brushSize, 1, 8, "%dpx", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::EndGroup();
+    nextItem(ImGui::CalcTextSize(Tr(i18n::Str::BtnInvertCanvas)).x +
+        ImGui::CalcTextSize(Tr(i18n::Str::BtnClearCanvas)).x + style.FramePadding.x * 4 + style.ItemSpacing.x);
 
     // Invert Canvas Action
     if (ImGui::Button(Tr(i18n::Str::BtnInvertCanvas))) {
@@ -147,19 +146,19 @@ void RenderToolbar(StudioState& studio, size_t catIdx) {
             }
         } else {
             std::vector<uint8_t> gray;
-            FirmwareBitmap::DecodeMask(raw, spec.byte_len(), spec.width, spec.height, gray);
+            FirmwareBitmap::DecodeMask(raw, spec.byte_len(), spec.width, spec.height, gray, spec.format);
             for (auto& v : gray) {
                 v = (v > 127) ? 0 : 255;
             }
             std::vector<uint8_t> newRaw;
-            if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
+            if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw, spec.format)) {
                 studio.SetBitmapReplacement(catIdx, std::move(newRaw));
             }
         }
         studio.textureNeedsUpdate = true;
     }
 
-    ImGui::SameLine();
+    nextButton(i18n::Str::BtnClearCanvas);
     // Clear Canvas Action
     if (ImGui::Button(Tr(i18n::Str::BtnClearCanvas))) {
         studio.PushUndo("Clear " + spec.id);
@@ -172,7 +171,7 @@ void RenderToolbar(StudioState& studio, size_t catIdx) {
         } else {
             std::vector<uint8_t> gray((size_t)spec.width * spec.height, 0);
             std::vector<uint8_t> newRaw;
-            if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
+            if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw, spec.format)) {
                 studio.SetBitmapReplacement(catIdx, std::move(newRaw));
             }
         }
@@ -195,7 +194,7 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
         FirmwareBitmap::DecodeRgb565(raw, spec.byte_len(), spec.width, spec.height, activeRgba);
     } else {
         std::vector<uint8_t> gray;
-        FirmwareBitmap::DecodeMask(raw, spec.byte_len(), spec.width, spec.height, gray);
+        FirmwareBitmap::DecodeMask(raw, spec.byte_len(), spec.width, spec.height, gray, spec.format);
         FirmwareBitmap::ColorizeMask(gray.data(), spec.width, spec.height, fgCol, bg, activeRgba);
     }
 
@@ -262,12 +261,12 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
                     }
                 } else {
                     std::vector<uint8_t> editGray;
-                    FirmwareBitmap::DecodeMask(raw, spec.byte_len(), spec.width, spec.height, editGray);
+                    FirmwareBitmap::DecodeMask(raw, spec.byte_len(), spec.width, spec.height, editGray, spec.format);
                     uint8_t targetVal = editGray[hoverPy * spec.width + hoverPx];
                     uint8_t fillVal = (targetVal > 127) ? 0 : 255;
                     FloodFillMask(editGray, spec.width, spec.height, hoverPx, hoverPy, targetVal, fillVal);
                     std::vector<uint8_t> newRaw;
-                    if (FirmwareBitmap::EncodeMaskPreserving(editGray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
+                    if (FirmwareBitmap::EncodeMaskPreserving(editGray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw, spec.format)) {
                         studio.SetBitmapReplacement(catIdx, std::move(newRaw));
                     }
                 }
@@ -317,7 +316,7 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
                     }
                 } else {
                     std::vector<uint8_t> editGray;
-                    FirmwareBitmap::DecodeMask(raw, spec.byte_len(), spec.width, spec.height, editGray);
+                    FirmwareBitmap::DecodeMask(raw, spec.byte_len(), spec.width, spec.height, editGray, spec.format);
                     uint8_t newCol = drawPixel ? 255 : 0;
 
                     bool changed = false;
@@ -336,7 +335,7 @@ void RenderCanvas(StudioState& studio, size_t catIdx, ID3D11Device* device, ID3D
                     }
                     if (changed) {
                         std::vector<uint8_t> newRaw;
-                        if (FirmwareBitmap::EncodeMaskPreserving(editGray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw)) {
+                        if (FirmwareBitmap::EncodeMaskPreserving(editGray.data(), spec.width, spec.height, studio.originals[catIdx].data(), spec.byte_len(), newRaw, spec.format)) {
                             studio.SetBitmapReplacement(catIdx, std::move(newRaw));
                             studio.textureNeedsUpdate = true;
                         }

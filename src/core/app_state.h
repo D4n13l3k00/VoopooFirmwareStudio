@@ -13,13 +13,21 @@
 #include <optional>
 #include <string_view>
 #include <deque>
+#include <atomic>
+#include <memory>
+#include <array>
 
 #include "firmware_color.h"
 #include "firmware_catalog.h"
 #include "firmware_bitmap.h"
 #include "zwdf_package.h"
 #include "embedded_firmware.h"
+#include "firmware_extensions.h"
+#include "firmware_layout.h"
+#include "firmware_logo_patch.h"
+#include "firmware_menu_patch.h"
 #include "i18n.h"
+#include "resource_i18n.h"
 #include "texture_cache.h"
 #include "path_utils.h"
 
@@ -30,16 +38,42 @@ namespace fs = std::filesystem;
 // -------------------------------------------------------------
 struct StudioState {
     // Loaded firmware
+    bool showStartupChooser = true;
     bool hasFirmware = false;
     bool isBuiltin = false;
     std::string firmwarePath;
+    // Project identity and saved baseline are independent of firmware exports.
+    std::string projectPath;
+    bool projectDocument = false;
+    bool firmwareSourceEmbedded = false; // Reopened project owns its source bytes, not an external source file.
     FirmwarePackage firmware;
+    FirmwareModel model = FirmwareModel::DragS;
+    FirmwareEdition edition = FirmwareEdition::Score;
     std::vector<AssetSpec> catalog;
     std::vector<std::vector<uint8_t>> originals; // Raw bytes in canonical record
     std::vector<std::vector<uint8_t>> referenceBitmaps; // Factory stock baseline from embedded firmware
     std::vector<std::vector<size_t>> locations;   // Locations across all records
     std::map<std::string, std::vector<uint8_t>> replacements; // Staged replacements
     std::vector<PaletteState> palette;
+    std::vector<FirmwareLayout::Element> layoutElements;
+    FirmwareLayout::Offsets layoutOffsets;
+    std::string layoutError;
+    FirmwareLogo::Patches screenPatches;
+    FirmwareLogo::Patches originalScreenPatches;
+    FirmwareLogo::Patches savedScreenPatches;
+    FirmwareMenu::Settings menuPatch;
+    FirmwareMenu::Settings originalMenuPatch;
+    FirmwareMenu::Settings savedMenuPatch;
+    FirmwareLogo::EditableSources screenPatchSources;
+    FirmwareLogo::EditableSources originalScreenPatchSources;
+    std::map<std::string, Rgb8, std::less<>> referencePalette;
+    Rgb8 referenceBackground;
+    struct SourcePaletteColor {
+        uint16_t code;
+        const char* role;
+        Rgb8 color;
+    };
+    std::vector<SourcePaletteColor> referenceRecordPalette;
     size_t selectedPaletteIdx = 0;
     Rgb8 backgroundColor = Rgb8(0, 0, 0);
 
@@ -81,6 +115,10 @@ struct StudioState {
         std::map<std::string, std::optional<Rgb8>> brushes;
         std::map<size_t, Rgb8> colors;
         std::optional<Rgb8> background;
+        std::map<std::string, std::optional<FirmwareLayout::Point>> layout;
+        std::array<std::optional<FirmwareLogo::Settings>, FirmwareLogo::TargetCount> screenPatches;
+        std::array<std::optional<FirmwareLogo::EditableSource>, FirmwareLogo::TargetCount> screenPatchSources;
+        std::optional<FirmwareMenu::Settings> menuPatch;
         size_t accountedBytes = 0;
 
         size_t MemoryBytes() const {
@@ -92,6 +130,12 @@ struct StudioState {
             for (const auto& [id, color] : brushes)
                 bytes += sizeof(decltype(brushes)::value_type) + 4 * sizeof(void*) + id.capacity() + 1;
             bytes += colors.size() * (sizeof(decltype(colors)::value_type) + 4 * sizeof(void*));
+            for (const auto& [id, position] : layout)
+                bytes += sizeof(decltype(layout)::value_type) + 4 * sizeof(void*) + id.capacity() + 1;
+            for (const auto& settings : screenPatches)
+                if (settings) bytes += settings->pixels.capacity();
+            for (const auto& source : screenPatchSources)
+                if (source && source->rgba) bytes += source->rgba->capacity();
             return bytes;
         }
     };
@@ -103,6 +147,9 @@ private:
     size_t historyMemoryBudget = DefaultHistoryMemoryBudget;
     size_t historyMemoryBytes = 0;
     mutable bool dirtyCacheValid = false;
+    uint64_t resourceRevision = 0;
+    inline static std::atomic<uint64_t> nextDocumentIdentity{1};
+    uint64_t documentIdentity = 0;
     mutable bool dirtyCache = false;
     std::string pendingHistoryDescription;
     bool historyActionOpen = false;
@@ -111,6 +158,11 @@ private:
     std::map<std::string, std::vector<uint8_t>> savedReplacements;
     std::vector<uint16_t> savedPalette;
     uint16_t savedBackground = 0;
+    FirmwareLayout::Offsets savedLayoutOffsets;
+    std::map<std::string, Rgb8> savedBrushes;
+    std::vector<Rgb8> savedProjectPalette;
+    Rgb8 savedProjectBackground;
+    FirmwareLogo::EditableSources savedScreenPatchSources;
 
     void RefreshHistoryAccounting(HistoryDelta& delta) {
         historyMemoryBytes -= delta.accountedBytes;
@@ -149,8 +201,15 @@ private:
     }
 
     void SwapHistoryDelta(HistoryDelta& delta) {
-        if (!delta.bitmaps.empty() || !delta.colors.empty() || delta.background)
+        if (!delta.bitmaps.empty() || !delta.colors.empty() || delta.background ||
+            !delta.layout.empty() || !delta.brushes.empty() || delta.menuPatch ||
+            std::any_of(delta.screenPatches.begin(), delta.screenPatches.end(),
+                [](const auto& settings) { return settings.has_value(); }) ||
+            std::any_of(delta.screenPatchSources.begin(), delta.screenPatchSources.end(),
+                [](const auto& source) { return source.has_value(); })) {
             dirtyCacheValid = false;
+            ++resourceRevision;
+        }
         for (auto& [id, stored] : delta.bitmaps) {
             auto current = replacements.find(id);
             if (stored) {
@@ -177,13 +236,29 @@ private:
                 assetPaintColors.erase(current);
             }
         }
+        for (auto& [id, stored] : delta.layout) {
+            auto current = layoutOffsets.find(id);
+            if (stored) {
+                if (current != layoutOffsets.end()) std::swap(current->second, *stored);
+                else { layoutOffsets.emplace(id, *stored); stored.reset(); }
+            } else if (current != layoutOffsets.end()) {
+                stored = current->second;
+                layoutOffsets.erase(current);
+            }
+        }
         for (auto& [index, stored] : delta.colors) std::swap(palette[index].current, stored);
         if (delta.background) std::swap(backgroundColor, *delta.background);
+        if (delta.menuPatch) std::swap(menuPatch, *delta.menuPatch);
+        for (size_t i = 0; i < screenPatches.size(); ++i)
+            if (delta.screenPatches[i]) std::swap(screenPatches[i], *delta.screenPatches[i]);
+        for (size_t i = 0; i < screenPatchSources.size(); ++i)
+            if (delta.screenPatchSources[i]) std::swap(screenPatchSources[i], *delta.screenPatchSources[i]);
         RefreshHistoryAccounting(delta);
     }
 
     void RecordBitmapChange(const std::string& id) {
         dirtyCacheValid = false;
+        ++resourceRevision;
         if (auto* delta = CurrentHistoryDelta(); delta && !delta->bitmaps.contains(id)) {
             const auto found = replacements.find(id);
             if (found == replacements.end()) delta->bitmaps.emplace(id, std::nullopt);
@@ -191,8 +266,20 @@ private:
             RefreshHistoryAccounting(*delta);
         }
     }
+    void RecordLayoutChange(const std::string& id) {
+        dirtyCacheValid = false;
+        ++resourceRevision;
+        if (auto* delta = CurrentHistoryDelta(); delta && !delta->layout.contains(id)) {
+            const auto found = layoutOffsets.find(id);
+            delta->layout.emplace(id, found == layoutOffsets.end() ?
+                std::nullopt : std::optional<FirmwareLayout::Point>(found->second));
+            RefreshHistoryAccounting(*delta);
+        }
+    }
+
 
     void RecordBrushChange(const std::string& id) {
+        dirtyCacheValid = false;
         if (auto* delta = CurrentHistoryDelta(); delta && !delta->brushes.contains(id)) {
             const auto found = assetPaintColors.find(id);
             if (found == assetPaintColors.end()) delta->brushes.emplace(id, std::nullopt);
@@ -216,6 +303,59 @@ public:
     }
 
     size_t HistoryMemoryBytes() const { return historyMemoryBytes; }
+    // Read-only consumers invalidate decoded resources without inspecting firmware bytes.
+    uint64_t ResourceRevision() const { return resourceRevision; }
+    uint64_t DocumentIdentity() const { return documentIdentity; }
+
+private:
+    // CPU payload only: no editor history, saved baselines, or GPU ownership.
+    std::shared_ptr<StudioState> CreateCpuSnapshot(
+        const FirmwareLogo::Patches* screenPatchesOverride = nullptr) const {
+        auto snapshot = std::make_shared<StudioState>();
+        snapshot->hasFirmware = hasFirmware;
+        snapshot->firmware = firmware;
+        snapshot->model = model;
+        snapshot->edition = edition;
+        snapshot->catalog = catalog;
+        snapshot->originals = originals;
+        snapshot->locations = locations;
+        snapshot->replacements = replacements;
+        snapshot->palette = palette;
+        snapshot->backgroundColor = backgroundColor;
+        snapshot->layoutElements = layoutElements;
+        snapshot->layoutOffsets = layoutOffsets;
+        snapshot->screenPatches = screenPatchesOverride ? *screenPatchesOverride : screenPatches;
+        snapshot->menuPatch = menuPatch;
+        snapshot->referencePalette = referencePalette;
+        snapshot->referenceBackground = referenceBackground;
+        snapshot->referenceRecordPalette = referenceRecordPalette;
+        snapshot->documentIdentity = documentIdentity;
+        snapshot->resourceRevision = resourceRevision;
+        return snapshot;
+    }
+
+public:
+    std::shared_ptr<const StudioState> CreateEmulationSnapshot(
+        const FirmwareLogo::Patches* screenPatchesOverride = nullptr) const {
+        return CreateCpuSnapshot(screenPatchesOverride);
+    }
+
+    // Project serialization needs the source filename, lossless original images,
+    // and brush metadata that firmware/emulation deliberately do not consume.
+    std::shared_ptr<const StudioState> CreateFileSnapshot() const {
+        auto snapshot = CreateCpuSnapshot();
+        snapshot->isBuiltin = isBuiltin;
+        snapshot->firmwarePath = firmwarePath;
+        snapshot->projectPath = projectPath;
+        snapshot->projectDocument = projectDocument;
+        snapshot->firmwareSourceEmbedded = firmwareSourceEmbedded;
+        snapshot->screenPatchSources = screenPatchSources;
+        snapshot->assetPaintColors = assetPaintColors;
+        snapshot->originalMenuPatch = originalMenuPatch;
+        snapshot->originalScreenPatches = originalScreenPatches;
+        snapshot->referenceBitmaps = referenceBitmaps;
+        return snapshot;
+    }
 
     void SetHistoryMemoryBudget(size_t bytes) {
         historyMemoryBudget = bytes;
@@ -282,6 +422,7 @@ public:
             if (inserted) RefreshHistoryAccounting(*delta);
         }
         dirtyCacheValid = false;
+        ++resourceRevision;
         palette[index].current = color;
         TrimHistory();
         SynchronizeColorEditors();
@@ -290,12 +431,62 @@ public:
     void SetBackgroundColor(Rgb8 color) {
         if (backgroundColor == color) return;
         dirtyCacheValid = false;
+        ++resourceRevision;
         if (auto* delta = CurrentHistoryDelta(); delta && !delta->background)
             delta->background = backgroundColor;
         backgroundColor = color;
         TrimHistory();
         SynchronizeColorEditors();
     }
+    void SetScreenPatch(FirmwareLogo::Target target, FirmwareLogo::Settings settings) {
+        const size_t index = static_cast<size_t>(target);
+        constexpr size_t pixelBytes = size_t(FirmwareLogo::Width) * FirmwareLogo::Height * 2;
+        if (index >= screenPatches.size() || screenPatches[index] == settings ||
+            static_cast<uint32_t>(settings.animation) >= static_cast<uint32_t>(FirmwareLogo::Animation::Count) ||
+            static_cast<uint32_t>(settings.exitAnimation) >= static_cast<uint32_t>(FirmwareLogo::Animation::Count) ||
+            static_cast<uint32_t>(settings.bootStages) < 1 || static_cast<uint32_t>(settings.bootStages) > 3 ||
+            (target != FirmwareLogo::Target::Boot && settings.bootStages != FirmwareLogo::BootStages::Second) ||
+            settings.holdMs > 10000 || settings.exitDurationMs < 200 || settings.exitDurationMs > 2000 ||
+            settings.durationMs < 200 || settings.durationMs > 2000 ||
+            (!settings.pixels.empty() && settings.pixels.size() != pixelBytes) ||
+            (settings.enabled && (settings.pixels.size() != pixelBytes || !FirmwareLogo::Supported(firmware)))) return;
+        if (auto* delta = CurrentHistoryDelta(); delta && !delta->screenPatches[index]) {
+            delta->screenPatches[index] = screenPatches[index];
+            RefreshHistoryAccounting(*delta);
+        }
+        screenPatches[index] = std::move(settings);
+        dirtyCacheValid = false;
+        ++resourceRevision;
+        TrimHistory();
+    }
+
+    void SetMenuPatch(FirmwareMenu::Settings settings) {
+        if (menuPatch == settings || (settings.enabled && !FirmwareMenu::Supported(firmware))) return;
+        if (auto* delta = CurrentHistoryDelta(); delta && !delta->menuPatch) {
+            delta->menuPatch = menuPatch;
+            RefreshHistoryAccounting(*delta);
+        }
+        menuPatch = settings;
+        dirtyCacheValid = false;
+        ++resourceRevision;
+        TrimHistory();
+    }
+
+    // Call alongside SetScreenPatch within one PushUndo action to apply both
+    // rendered firmware pixels and editable project metadata atomically.
+    void SetScreenPatchSource(FirmwareLogo::Target target, FirmwareLogo::EditableSource source) {
+        const size_t index = static_cast<size_t>(target);
+        if (index >= screenPatchSources.size() || !source.Valid() || screenPatchSources[index] == source) return;
+        if (auto* delta = CurrentHistoryDelta(); delta && !delta->screenPatchSources[index]) {
+            delta->screenPatchSources[index] = screenPatchSources[index];
+            RefreshHistoryAccounting(*delta);
+        }
+        screenPatchSources[index] = std::move(source);
+        dirtyCacheValid = false;
+        ++resourceRevision;
+        TrimHistory();
+    }
+
 
     void SetAssetPaintColor(const std::string& id, Rgb8 color) {
         const auto found = assetPaintColors.find(id);
@@ -306,9 +497,23 @@ public:
         SynchronizeColorEditors();
     }
 
+    void EnableProjectDocument() {
+        projectDocument = true;
+        dirtyCacheValid = false;
+    }
+
     void MarkSaved() {
         EndUndoAction();
         savedReplacements = replacements;
+        savedLayoutOffsets = layoutOffsets;
+        savedScreenPatches = screenPatches;
+        savedMenuPatch = menuPatch;
+        savedScreenPatchSources = screenPatchSources;
+        savedBrushes = assetPaintColors;
+        savedProjectPalette.clear();
+        savedProjectPalette.reserve(palette.size());
+        for (const auto& entry : palette) savedProjectPalette.push_back(entry.current);
+        savedProjectBackground = backgroundColor;
         savedPalette.clear();
         savedPalette.reserve(palette.size());
         for (const auto& entry : palette) savedPalette.push_back(entry.current.ToRgb565());
@@ -329,6 +534,16 @@ public:
 private:
     bool ComputeUnsavedChanges() const {
         if (!hasFirmware) return false;
+        if (screenPatches != savedScreenPatches) return true;
+        if (menuPatch != savedMenuPatch) return true;
+        if (screenPatchSources != savedScreenPatchSources) return true;
+        if (layoutOffsets != savedLayoutOffsets) return true;
+        if (projectDocument) {
+            if (assetPaintColors != savedBrushes || backgroundColor != savedProjectBackground ||
+                palette.size() != savedProjectPalette.size()) return true;
+            for (size_t i = 0; i < palette.size(); ++i)
+                if (palette[i].current != savedProjectPalette[i]) return true;
+        }
         if (palette.size() != savedPalette.size() || backgroundColor.ToRgb565() != savedBackground)
             return true;
         for (size_t i = 0; i < palette.size(); ++i)
@@ -353,7 +568,7 @@ public:
         BucketFill
     };
     PixelTool activePixelTool = PixelTool::Pencil;
-    int brushSize = 1; // 1 to 4 px
+    int brushSize = 1; // 1 to 8 px
     bool isPixelStrokeActive = false;
 
     // Hardware Textures for ImGui
@@ -362,26 +577,6 @@ public:
     Dx11Texture horizontalPreviewTexture;
     bool textureNeedsUpdate = true;
 
-    void InitReferenceBitmaps(const FirmwarePackage& refPkg) {
-        auto cat = GetAllAssets();
-        size_t canonical = 0;
-        for (size_t r = 0; r < refPkg.records.size(); ++r) {
-            if (refPkg.records[r].device_code[0] == 0x31 && refPkg.records[r].device_code[1] == 0x03) {
-                canonical = r;
-                break;
-            }
-        }
-        referenceBitmaps.clear();
-        referenceBitmaps.reserve(cat.size());
-        for (const auto& spec : cat) {
-            const uint8_t* ptr = refPkg.BytesAt(canonical, spec.address, spec.byte_len());
-            if (ptr) {
-                referenceBitmaps.emplace_back(ptr, ptr + spec.byte_len());
-            } else {
-                referenceBitmaps.emplace_back();
-            }
-        }
-    }
 
     bool IsActiveMatchingReference(size_t catalog_idx) const {
         if (catalog_idx >= referenceBitmaps.size() || catalog_idx >= catalog.size()) return true;
@@ -445,6 +640,27 @@ public:
         textureNeedsUpdate = true;
         TrimHistory();
     }
+    bool SetLayoutOffset(size_t index, FirmwareLayout::Point offset, std::string& error) {
+        error.clear();
+        if (index >= layoutElements.size()) { error = "Unknown native layout element"; return false; }
+        const auto& element = layoutElements[index];
+        if (element.stepX <= 0 || element.stepY <= 0 ||
+            offset.x < element.minimumOffset.x || offset.x > element.maximumOffset.x ||
+            offset.y < element.minimumOffset.y || offset.y > element.maximumOffset.y ||
+            offset.x % element.stepX || offset.y % element.stepY) {
+            error = "Position is outside the native layout coordinate range";
+            return false;
+        }
+        const auto found = layoutOffsets.find(element.id);
+        const auto current = found == layoutOffsets.end() ? FirmwareLayout::Point{} : found->second;
+        if (current == offset) return true;
+        RecordLayoutChange(element.id);
+        if (offset == FirmwareLayout::Point{}) layoutOffsets.erase(element.id);
+        else layoutOffsets[element.id] = offset;
+        TrimHistory();
+        return true;
+    }
+
 
     const uint8_t* GetCurrentRaw(size_t catalog_idx) const {
         const auto& spec = catalog[catalog_idx];
@@ -463,16 +679,55 @@ public:
         return {255, 255, 255};
     }
 
+    Rgb8 GetPaletteColorForRecord(const char* id, uint16_t code) const {
+        for (const auto& role : palette) {
+            if (std::string_view(role.spec.id) != id) continue;
+            const auto stock = referencePalette.find(id);
+            if (stock != referencePalette.end() && role.current == stock->second) {
+                for (const auto& actual : referenceRecordPalette)
+                    if (actual.code == code && std::string_view(actual.role) == id) return actual.color;
+            }
+            if (role.current == role.spec.original) {
+                Rgb8 actual;
+                if (FirmwareRecordPaletteColor(firmware, code, id, actual)) return actual;
+            }
+            return role.current;
+        }
+        return {255, 255, 255};
+    }
+
     Rgb8 GetForegroundForAsset(const AssetSpec& spec) const {
-        const char* pid = PaletteIdForAsset(spec, previewRank, previewCyanMode);
-        return pid ? GetPaletteColor(pid) : FirmwareFixedForeground(firmware, spec, previewRank);
+        return GetForegroundForAsset(spec, previewRank, previewCyanMode);
+    }
+
+    Rgb8 GetForegroundForAsset(const AssetSpec& spec, size_t rank, bool cyan) const {
+        if (const auto* extension = FirmwareExtensionFor(model))
+            return extension->foreground(firmware, spec, palette, cyan);
+        const char* pid = PaletteIdForAsset(spec, rank, cyan, edition, model);
+        if (!pid) return FirmwareFixedForeground(firmware, spec, rank);
+        if (edition == FirmwareEdition::Factory)
+            return GetPaletteColorForRecord(pid, spec.sourceCode ? spec.sourceCode : FirmwareCanonicalCode(model));
+        return GetPaletteColor(pid);
     }
 
     Rgb8 GetBackgroundForAsset(const AssetSpec& spec) const {
+        return GetBackgroundForAsset(spec, previewCyanMode);
+    }
+
+    Rgb8 GetBackgroundForAsset(const AssetSpec& spec, bool cyan) const {
+        if (const auto* extension = FirmwareExtensionFor(model))
+            return extension->background(firmware, spec, palette, cyan);
+        if (edition == FirmwareEdition::Factory) {
+            if (spec.id == "factory_legacy_label_puff") {
+                const char* roleId = cyan ? "accent_cyan" : "accent_red";
+                return GetPaletteColorForRecord(roleId, spec.sourceCode);
+            }
+            return {0, 0, 0};
+        }
         // Only the 11x20 puff digits are drawn over the mode accent strip.
         // Global background recoloring is unsupported by the firmware patcher.
         if (spec.id.rfind("font_11x20_", 0) == 0)
-            return GetPaletteColor(previewCyanMode ? "accent_cyan" : "accent_red");
+            return GetPaletteColor(cyan ? "accent_cyan" : "accent_red");
         return {0, 0, 0};
     }
 
@@ -482,28 +737,12 @@ public:
     }
 
     bool BuildZwdfBytes(std::vector<uint8_t>& outBytes, std::string& outErr) const {
-        if (!hasFirmware) {
-            outErr = "No firmware loaded in Resource Studio";
-            return false;
-        }
-        std::vector<CodePatch> codePatches;
-        if (!BuildColorPatches(firmware, palette, backgroundColor, codePatches, outErr)) {
-            return false;
-        }
-        std::map<std::string, std::pair<std::vector<size_t>, std::vector<uint8_t>>> repMap;
-        for (size_t i = 0; i < catalog.size(); ++i) {
-            const auto& spec = catalog[i];
-            auto it = replacements.find(spec.id);
-            if (it != replacements.end()) {
-                repMap[spec.id] = { locations[i], it->second };
-            }
-        }
-        BuildReport rep;
-        return firmware.PackWith(repMap, codePatches, outBytes, rep, outErr);
+        return BuildToBuffer(outBytes, outErr);
     }
 
     void UpdateVisible() {
         std::string f(filterBuf);
+        const std::wstring query = PathUtils::Utf8ToWide(f);
         std::transform(f.begin(), f.end(), f.begin(), [](unsigned char c){ return (char)::tolower(c); });
 
         const char* groupNames[] = { "", "Alerts", "Font", "Score", "Labels", "Controls", "Units", "Screens", "Animation" };
@@ -519,11 +758,7 @@ public:
                 continue;
             }
             if (!f.empty()) {
-                std::string titleLower = spec.title;
-                std::transform(titleLower.begin(), titleLower.end(), titleLower.begin(), [](unsigned char c){ return (char)::tolower(c); });
-                std::string idLower = spec.id;
-                std::transform(idLower.begin(), idLower.end(), idLower.begin(), [](unsigned char c){ return (char)::tolower(c); });
-                if (titleLower.find(f) == std::string::npos && idLower.find(f) == std::string::npos) {
+                if (!i18n::ResourceTextMatches(spec.title, query) && spec.id.find(f) == std::string::npos) {
                     continue;
                 }
             }
@@ -541,12 +776,14 @@ public:
         textureNeedsUpdate = true;
     }
 
-    bool OpenFirmware(const std::string& path, std::string& err) {
+    bool OpenFirmware(const std::string& path, std::string& err,
+                      const std::function<void(const char*)>& progress = {}) {
         FirmwarePackage pkg;
-        if (!FirmwarePackage::Open(path, pkg, err)) {
+        if (!FirmwarePackage::Open(path, pkg, err, progress)) {
             return false;
         }
 
+        if (progress) progress("Load firmware resources, palette and layout");
         bool res = LoadPackage(std::move(pkg), path, err);
         if (res) {
             isBuiltin = false;
@@ -555,22 +792,64 @@ public:
     }
 
     bool LoadPackage(FirmwarePackage pkg, const std::string& path, std::string& err) {
-        auto cat = GetAllAssets();
-        size_t canonical = 0;
+        FirmwareMenu::Settings loadedMenuPatch;
+        if (!FirmwareMenu::Extract(pkg, loadedMenuPatch, err)) return false;
+        FirmwareLogo::Patches loadedScreenPatches;
+        if (!FirmwareLogo::Canonicalize(pkg, loadedScreenPatches, err)) return false;
+        FirmwareModel detectedModel;
+        FirmwareEdition detectedEdition;
+        if (!DetectFirmwareProfile(pkg, detectedModel, detectedEdition)) {
+            err = "Unsupported or mixed firmware package.";
+            return false;
+        }
+        auto newPalette = GetDefaultPalette();
+        Rgb8 newBackground(0, 0, 0);
+        if (!DetectFirmwareColors(pkg, newPalette, newBackground)) {
+            err = "Unsupported firmware palette layout for " + std::string(FirmwareModelName(detectedModel));
+            return false;
+        }
+        auto cat = GetAllAssets(detectedModel, detectedEdition);
+        const uint16_t canonicalCode = FirmwareCanonicalCode(detectedModel);
+        size_t canonical = pkg.records.size();
         for (size_t r = 0; r < pkg.records.size(); ++r) {
-            if (pkg.records[r].device_code[0] == 0x31 && pkg.records[r].device_code[1] == 0x03) {
+            if (((pkg.records[r].device_code[0] << 8) | pkg.records[r].device_code[1]) == canonicalCode) {
                 canonical = r;
                 break;
             }
         }
 
+        FirmwarePackage refPkg;
+        if (!LoadEmbeddedFirmware(refPkg, err, detectedModel, detectedEdition)) return false;
+        std::vector<size_t> referenceRecords;
+        if (detectedModel == FirmwareModel::DragS || detectedModel == FirmwareModel::DragX) {
+            referenceRecords.reserve(pkg.records.size());
+            for (const auto& record : pkg.records) {
+                const auto found = std::find_if(refPkg.records.begin(), refPkg.records.end(),
+                    [&](const auto& candidate) { return candidate.device_code[0] == record.device_code[0] &&
+                        candidate.device_code[1] == record.device_code[1]; });
+                if (found == refPkg.records.end()) {
+                    err = "Unknown hardware record in native resource map";
+                    return false;
+                }
+                referenceRecords.push_back(size_t(found - refPkg.records.begin()));
+            }
+        }
         std::vector<std::vector<uint8_t>> origs;
         std::vector<std::vector<size_t>> locs;
         origs.reserve(cat.size());
         locs.reserve(cat.size());
 
         for (const auto& spec : cat) {
-            const uint8_t* ptr = pkg.BytesAt(canonical, spec.address, spec.byte_len());
+            size_t source = canonical;
+            if (spec.sourceCode) {
+                source = pkg.records.size();
+                for (size_t r = 0; r < pkg.records.size(); ++r)
+                    if (((pkg.records[r].device_code[0] << 8) | pkg.records[r].device_code[1]) == spec.sourceCode) {
+                        source = r;
+                        break;
+                    }
+            }
+            const uint8_t* ptr = pkg.BytesAt(source, spec.address, spec.byte_len());
             if (!ptr) {
                 err = "Asset " + spec.id + " is outside linked flash in record " + std::to_string(canonical);
                 return false;
@@ -581,9 +860,37 @@ public:
             asset_locs.reserve(pkg.records.size());
             for (size_t r = 0; r < pkg.records.size(); ++r) {
                 size_t offset = 0;
-                if (!pkg.FindUnique(r, orig.data(), orig.size(), offset)) {
-                    err = "Cannot map unique signature for " + spec.id + " in record " + std::to_string(r);
-                    return false;
+                if (!spec.recordAddresses.empty()) {
+                    const uint16_t code = (pkg.records[r].device_code[0] << 8) | pkg.records[r].device_code[1];
+                    const auto address = std::find_if(spec.recordAddresses.begin(), spec.recordAddresses.end(),
+                        [code](const auto& item) { return item.first == code; });
+                    if (address == spec.recordAddresses.end()) {
+                        asset_locs.push_back(SIZE_MAX);
+                        continue;
+                    }
+                    if (!pkg.BytesAt(r, address->second, spec.byte_len())) {
+                        err = "Asset " + spec.id + " is outside linked flash";
+                        return false;
+                    }
+                    offset = address->second - pkg.records[r].linked_base;
+                } else if (detectedModel == FirmwareModel::Drag2 || FirmwareExtensionFor(detectedModel)) {
+                    // One linked ROM: addresses remain stable after arbitrary
+                    // edits, including duplicate or completely blank masks.
+                    if (!pkg.BytesAt(r, spec.address, spec.byte_len())) {
+                        err = "Asset " + spec.id + " is outside linked flash";
+                        return false;
+                    }
+                    offset = spec.address - pkg.records[r].linked_base;
+                } else {
+                    // Locate in the immutable release, never in edited mask
+                    // payloads: blank or duplicated replacements are valid.
+                    const auto* signature = refPkg.BytesAt(referenceRecords[source], spec.address, spec.byte_len());
+                    if (!signature || !refPkg.FindUnique(referenceRecords[r], signature, spec.byte_len(), offset) ||
+                        offset > pkg.records[r].image.size() ||
+                        spec.byte_len() > pkg.records[r].image.size() - offset) {
+                        err = "Cannot map unique release signature for " + spec.id + " in record " + std::to_string(r);
+                        return false;
+                    }
                 }
                 asset_locs.push_back(offset);
             }
@@ -592,33 +899,149 @@ public:
             locs.push_back(std::move(asset_locs));
         }
 
+        auto stockPalette = GetDefaultPalette();
+        Rgb8 stockBackground;
+        if (!DetectFirmwareColors(refPkg, stockPalette, stockBackground)) {
+            err = "Embedded stock palette layout is unsupported";
+            return false;
+        }
+        std::map<std::string, Rgb8, std::less<>> stockColors;
+        for (const auto& role : stockPalette) stockColors.emplace(role.spec.id, role.current);
+        std::vector<SourcePaletteColor> stockRecordColors;
+        if (FirmwareHasPalette(detectedModel)) {
+            stockRecordColors.reserve(refPkg.records.size() * stockPalette.size());
+            for (const auto& record : refPkg.records) {
+                const uint16_t code = (record.device_code[0] << 8) | record.device_code[1];
+                for (const auto& role : stockPalette) {
+                    Rgb8 actual;
+                    if (FirmwareRecordPaletteColor(refPkg, code, role.spec.id, actual))
+                        stockRecordColors.push_back({code, role.spec.id, actual});
+                }
+            }
+        }
+        size_t referenceCanonical = refPkg.records.size();
+        for (size_t r = 0; r < refPkg.records.size(); ++r) {
+            if (((refPkg.records[r].device_code[0] << 8) | refPkg.records[r].device_code[1]) == canonicalCode) {
+                referenceCanonical = r;
+                break;
+            }
+        }
+        std::vector<std::vector<uint8_t>> refs;
+        refs.reserve(cat.size());
+        for (const auto& spec : cat) {
+            size_t source = referenceCanonical;
+            if (spec.sourceCode) {
+                source = refPkg.records.size();
+                for (size_t r = 0; r < refPkg.records.size(); ++r)
+                    if (((refPkg.records[r].device_code[0] << 8) | refPkg.records[r].device_code[1]) == spec.sourceCode) {
+                        source = r;
+                        break;
+                    }
+            }
+            const uint8_t* ptr = refPkg.BytesAt(source, spec.address, spec.byte_len());
+            if (!ptr) {
+                err = "Embedded stock asset " + spec.id + " is outside linked flash";
+                return false;
+            }
+            refs.emplace_back(ptr, ptr + spec.byte_len());
+        }
+
+        std::vector<FirmwareLayout::Element> newLayout;
+        std::string newLayoutError;
+        if (!FirmwareLayout::Discover(pkg, newLayout, newLayoutError)) newLayout.clear();
+
         hasFirmware = true;
+        documentIdentity = nextDocumentIdentity.fetch_add(1, std::memory_order_relaxed);
+        projectPath.clear();
+        projectDocument = false;
+        firmwareSourceEmbedded = false;
+        isBuiltin = false;
         firmwarePath = path;
         firmware = std::move(pkg);
+        screenPatches = std::move(loadedScreenPatches);
+        originalScreenPatches = screenPatches;
+        menuPatch = loadedMenuPatch;
+        originalMenuPatch = menuPatch;
+        screenPatchSources = {};
+        originalScreenPatchSources = {};
+        model = detectedModel;
+        edition = detectedEdition;
         catalog = std::move(cat);
         originals = std::move(origs);
         locations = std::move(locs);
+        referenceBitmaps = std::move(refs);
         replacements.clear();
+        layoutElements = std::move(newLayout);
+        layoutOffsets.clear();
+        layoutError = std::move(newLayoutError);
         undoStack.clear();
         redoStack.clear();
         historyMemoryBytes = 0;
         EndUndoAction();
         isPixelStrokeActive = false;
-        if (referenceBitmaps.empty()) {
-            FirmwarePackage refPkg;
-            std::string refErr;
-            if (LoadEmbeddedFirmware(refPkg, refErr)) {
-                InitReferenceBitmaps(refPkg);
-            }
-        }
         assetPaintColors.clear();
-        palette = GetDefaultPalette();
+        palette = std::move(newPalette);
+        referencePalette = std::move(stockColors);
+        referenceBackground = stockBackground;
+        referenceRecordPalette = std::move(stockRecordColors);
         selectedPaletteIdx = 0;
-        backgroundColor = Rgb8(0, 0, 0);
-        DetectFirmwareColors(firmware, palette, backgroundColor);
+        backgroundColor = newBackground;
+        ++resourceRevision;
         SynchronizeEditorState();
         MarkSaved();
         return true;
+    }
+
+    // UI-thread commit of a completely parsed document. GPU/view state stays
+    // local and history never crosses document boundaries.
+    void AdoptLoadedDocument(StudioState& document) {
+        hasFirmware = document.hasFirmware;
+        documentIdentity = document.documentIdentity;
+        isBuiltin = document.isBuiltin;
+        firmwarePath = std::move(document.firmwarePath);
+        projectPath = std::move(document.projectPath);
+        projectDocument = document.projectDocument;
+        firmwareSourceEmbedded = document.firmwareSourceEmbedded;
+        firmware = std::move(document.firmware);
+        model = document.model;
+        edition = document.edition;
+        catalog = std::move(document.catalog);
+        originals = std::move(document.originals);
+        referenceBitmaps = std::move(document.referenceBitmaps);
+        locations = std::move(document.locations);
+        replacements = std::move(document.replacements);
+        palette = std::move(document.palette);
+        layoutElements = std::move(document.layoutElements);
+        layoutOffsets = std::move(document.layoutOffsets);
+        layoutError = std::move(document.layoutError);
+        screenPatches = std::move(document.screenPatches);
+        originalScreenPatches = std::move(document.originalScreenPatches);
+        menuPatch = document.menuPatch;
+        originalMenuPatch = document.originalMenuPatch;
+        screenPatchSources = std::move(document.screenPatchSources);
+        originalScreenPatchSources = std::move(document.originalScreenPatchSources);
+        referencePalette = std::move(document.referencePalette);
+        referenceBackground = document.referenceBackground;
+        referenceRecordPalette = std::move(document.referenceRecordPalette);
+        assetPaintColors = std::move(document.assetPaintColors);
+        backgroundColor = document.backgroundColor;
+        selectedPaletteIdx = 0;
+        undoStack.clear();
+        redoStack.clear();
+        historyMemoryBytes = 0;
+        isPixelStrokeActive = false;
+        showBuildModal = false;
+        lastReport = {};
+        lastBuildPath.clear();
+        ++resourceRevision;
+        SynchronizeEditorState();
+        MarkSaved();
+    }
+
+    void AdoptProjectDocument(StudioState& document) {
+        document.projectDocument = true;
+        document.firmwareSourceEmbedded = true;
+        AdoptLoadedDocument(document);
     }
 
     int FindAssetIndex(const std::string& id) const {
@@ -646,21 +1069,32 @@ public:
         PushUndo("Revert all");
         for (const auto& [id, raw] : replacements) RecordBitmapChange(id);
         for (const auto& [id, color] : assetPaintColors) RecordBrushChange(id);
+        for (const auto& [id, position] : layoutOffsets) RecordLayoutChange(id);
+        for (size_t i = 0; i < screenPatches.size(); ++i) {
+            SetScreenPatch(static_cast<FirmwareLogo::Target>(i), originalScreenPatches[i]);
+            SetScreenPatchSource(static_cast<FirmwareLogo::Target>(i), originalScreenPatchSources[i]);
+        }
+        SetMenuPatch(originalMenuPatch);
         replacements.clear();
         assetPaintColors.clear();
+        layoutOffsets.clear();
         TrimHistory();
         SynchronizeEditorState();
     }
 
-    bool BuildToBuffer(std::vector<uint8_t>& outBytes, std::string& err, BuildReport* outReport = nullptr) {
+    bool BuildToBuffer(std::vector<uint8_t>& outBytes, std::string& err, BuildReport* outReport = nullptr,
+                       const std::function<void(const char*)>& progress = {}) const {
         if (!hasFirmware) {
             err = "No firmware loaded.";
             return false;
         }
+        if (progress) progress("Build palette, layout and resource patches");
         std::vector<CodePatch> codePatches;
         if (!BuildColorPatches(firmware, palette, backgroundColor, codePatches, err)) {
             return false;
         }
+        if (!FirmwareLayout::BuildPatches(firmware, layoutElements, layoutOffsets, codePatches, err))
+            return false;
         std::map<std::string, std::pair<std::vector<size_t>, std::vector<uint8_t>>> repMap;
         for (size_t i = 0; i < catalog.size(); ++i) {
             const auto& spec = catalog[i];
@@ -670,7 +1104,8 @@ public:
             }
         }
         BuildReport rep;
-        if (!firmware.PackWith(repMap, codePatches, outBytes, rep, err)) return false;
+        if (!FirmwareLogo::Build(firmware, screenPatches, repMap, codePatches, outBytes, rep, err, progress)) return false;
+        if (!FirmwareMenu::Apply(outBytes, menuPatch, rep, err)) return false;
         if (outReport) *outReport = std::move(rep);
         return true;
     }
@@ -819,10 +1254,24 @@ inline void ApplyPaletteTheme(StudioState& studio, const PaletteTheme& t) {
     const char* localizedThemeName = GetThemeNameTr(themeIdx);
     studio.PushUndo(std::string("Apply theme ") + localizedThemeName);
     for (size_t i = 0; i < studio.palette.size(); ++i) {
-        const std::string_view id = studio.palette[i].spec.id;
-        if (id == "accent_red") studio.SetPaletteColor(i, t.accent_red);
-        else if (id == "accent_cyan") studio.SetPaletteColor(i, t.accent_cyan);
-        else if (id == "highlight_yellow") studio.SetPaletteColor(i, t.highlight_yellow);
+        std::string_view id = studio.palette[i].spec.id;
+        const auto stock = studio.referencePalette.find(id);
+        if (themeIdx == 0 && stock != studio.referencePalette.end()) {
+            studio.SetPaletteColor(i, stock->second);
+            continue;
+        }
+        if (id.starts_with("pro_")) id.remove_prefix(4);
+        if (id.starts_with("mode_")) {
+            const Rgb8 base = id.starts_with("mode_smart") ? t.highlight_yellow :
+                (id.starts_with("mode_rba") || id.starts_with("mode_cyan")) ? t.accent_cyan : t.accent_red;
+            studio.SetPaletteColor(i, id.ends_with("_dim")
+                ? Rgb8(base.r / 2, base.g / 2, base.b / 2) : base);
+        }
+        else if (id == "accent_red" || id == "warning_red") studio.SetPaletteColor(i, t.accent_red);
+        else if (id == "accent_cyan" || id == "success_green" || id == "temperature_green" ||
+            id == "alert_cyan" || id == "warning_cyan" || id == "unlock_green") studio.SetPaletteColor(i, t.accent_cyan);
+        else if (id == "highlight_yellow" || id == "warning_orange" ||
+            id == "native_orange" || id == "native_max_accent") studio.SetPaletteColor(i, t.highlight_yellow);
         else if (id == "rank_bronze") studio.SetPaletteColor(i, t.rank_bronze);
         else if (id == "rank_gold") studio.SetPaletteColor(i, t.rank_gold);
         else if (id == "rank_ice") studio.SetPaletteColor(i, t.rank_ice);
@@ -830,9 +1279,17 @@ inline void ApplyPaletteTheme(StudioState& studio, const PaletteTheme& t) {
         else if (id == "rank_orange") studio.SetPaletteColor(i, t.rank_orange);
         else if (id == "rank_red") studio.SetPaletteColor(i, t.rank_red);
         else if (id == "digits_wattage") studio.SetPaletteColor(i, t.digits_wattage);
-        else if (id == "digits_stats") studio.SetPaletteColor(i, t.digits_stats);
+        else if (id == "digits_stats" || id == "text" || id == "grid_gray") studio.SetPaletteColor(i, t.digits_stats);
+        else if (id == "service_green") studio.SetPaletteColor(i, t.accent_cyan);
+        else if (id == "frame_gray")
+            studio.SetPaletteColor(i, Rgb8(t.digits_stats.r / 2, t.digits_stats.g / 2, t.digits_stats.b / 2));
+        else if (id == "native_green" || id == "native_lime") studio.SetPaletteColor(i, t.accent_cyan);
+        else if (id == "native_muted_red")
+            studio.SetPaletteColor(i, Rgb8(t.accent_red.r / 2, t.accent_red.g / 2, t.accent_red.b / 2));
+        else if (id == "native_gray" || id == "native_silver")
+            studio.SetPaletteColor(i, Rgb8(t.digits_stats.r / 2, t.digits_stats.g / 2, t.digits_stats.b / 2));
     }
-    studio.SetBackgroundColor(t.background);
+    studio.SetBackgroundColor(themeIdx == 0 ? studio.referenceBackground : t.background);
     char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgAppliedColorTheme), localizedThemeName); studio.statusMsg = _m;
     studio.statusIsErr = false;
     studio.textureNeedsUpdate = true;
@@ -849,7 +1306,7 @@ inline void CopyCurrentSelectedAsset(StudioState& studio, HWND hwnd) {
         FirmwareBitmap::DecodeRgb565(raw, s.byte_len(), s.width, s.height, rgba);
     } else {
         std::vector<uint8_t> gray;
-        FirmwareBitmap::DecodeMask(raw, s.byte_len(), s.width, s.height, gray);
+        FirmwareBitmap::DecodeMask(raw, s.byte_len(), s.width, s.height, gray, s.format);
         Rgb8 fg = studio.GetForegroundForAsset(s);
         FirmwareBitmap::ColorizeMask(gray.data(), s.width, s.height, fg, studio.GetBackgroundForAsset(s), rgba);
     }
@@ -899,7 +1356,7 @@ inline void PasteIntoCurrentSelectedAsset(StudioState& studio, HWND hwnd) {
         std::vector<uint8_t> fittedGray;
         FirmwareBitmap::FitGrayscale(graySrc.data(), pw, ph, s.width, s.height, fittedGray);
         std::vector<uint8_t> newRaw;
-        if (FirmwareBitmap::EncodeMaskPreserving(fittedGray.data(), s.width, s.height, studio.originals[catIdx].data(), s.byte_len(), newRaw)) {
+        if (FirmwareBitmap::EncodeMaskPreserving(fittedGray.data(), s.width, s.height, studio.originals[catIdx].data(), s.byte_len(), newRaw, s.format)) {
             studio.SetBitmapReplacement(catIdx, std::move(newRaw));
             char buf[256];
             snprintf(buf, sizeof(buf), Tr(i18n::Str::MsgPastedFromClipboard), s.id.c_str());

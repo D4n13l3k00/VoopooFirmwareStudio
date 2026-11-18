@@ -184,6 +184,104 @@ inline bool RunHistoryRegressions(std::string& error) {
         check(state.LoadPackage(std::move(embedded), "embedded", loadError), "load package failed");
         check(!state.HasUnsavedChanges() && !state.CanUndo() && !state.CanRedo(),
               "load package retained dirty baseline or history");
+        const auto loadedIdentity = state.DocumentIdentity();
+        const auto cleanRevision = state.ResourceRevision();
+        const FirmwareMenu::Settings selectedMenu{true, true, true,
+            {FirmwareMenu::Item::Exit, FirmwareMenu::Item::PuffEditor,
+             FirmwareMenu::Item::Information, FirmwareMenu::Item::Voltage},
+            FirmwareMenu::InformationMask | FirmwareMenu::PuffEditorMask, FirmwareMenu::InfoResistanceMask};
+        state.PushUndo("Device menu and imported resource");
+        state.SetMenuPatch(selectedMenu);
+        auto importedPixels = state.originals.front();
+        importedPixels.front() ^= 1;
+        state.SetBitmapReplacement(0, std::move(importedPixels));
+        state.EndUndoAction();
+        check(state.menuPatch == selectedMenu &&
+              state.ResourceRevision() > cleanRevision && state.HasUnsavedChanges() &&
+              state.undoStack.size() == 1 && state.undoStack.back().menuPatch.has_value() &&
+              state.undoStack.back().bitmaps.size() == 1,
+              "menu/resource transaction lost settings, revision, dirty state, or inverse delta");
+        const auto cpu = state.CreateEmulationSnapshot();
+        const auto file = state.CreateFileSnapshot();
+        check(cpu->menuPatch == state.menuPatch && file->menuPatch == state.menuPatch &&
+              file->originalMenuPatch == state.originalMenuPatch &&
+              cpu->DocumentIdentity() == loadedIdentity && cpu->ResourceRevision() == state.ResourceRevision(),
+              "CPU/file snapshot omitted menu inputs or source generation");
+        state.MarkSaved();
+        check(state.Undo() && state.menuPatch == FirmwareMenu::Settings{} &&
+              state.replacements.empty() && state.HasUnsavedChanges(),
+              "menu/resource undo did not leave the saved baseline atomically");
+        check(state.Redo() && state.menuPatch == selectedMenu &&
+              state.GetCurrentRaw(0)[0] != state.originals[0][0] && !state.HasUnsavedChanges(),
+              "menu/resource redo did not restore the saved baseline atomically");
+        check(accountingMatches(state), "menu inverse delta corrupted history byte accounting");
+        state.RevertAllAssets();
+        check(state.menuPatch == state.originalMenuPatch && state.replacements.empty(),
+              "restore original omitted device menu settings");
+        check(state.Undo() && state.menuPatch == selectedMenu &&
+              !state.HasUnsavedChanges(), "restore-original undo omitted menu settings");
+        state.PushUndo("Menu no-op");
+        state.SetMenuPatch(state.menuPatch);
+        check(state.CanRedo(), "menu no-op discarded redo");
+        const auto fieldRevision = state.ResourceRevision();
+        auto changedFields = selectedMenu;
+        changedFields.infoFields = FirmwareMenu::InfoBatteryMask | FirmwareMenu::InfoDurationMask;
+        state.PushUndo("Menu INFO fields");
+        state.SetMenuPatch(changedFields);
+        state.EndUndoAction();
+        check(state.menuPatch == changedFields && state.ResourceRevision() > fieldRevision &&
+              state.HasUnsavedChanges(), "INFO field edit omitted revision or saved-state invalidation");
+        check(state.Undo() && state.menuPatch == selectedMenu && !state.HasUnsavedChanges(),
+              "INFO field undo did not restore saved baseline");
+        check(state.Redo() && state.menuPatch == changedFields && state.HasUnsavedChanges() &&
+              state.Undo() && !state.HasUnsavedChanges(),
+              "INFO field redo/undo lost field choices or saved status");
+        auto puffOnly = selectedMenu;
+        puffOnly.enabledItems = FirmwareMenu::PuffEditorMask;
+        puffOnly.infoFields = 0;
+        state.PushUndo("Puff editor only");
+        state.SetMenuPatch(puffOnly);
+        state.EndUndoAction();
+        check(state.menuPatch == puffOnly && state.HasUnsavedChanges() &&
+              state.Undo() && state.menuPatch == selectedMenu && !state.HasUnsavedChanges() &&
+              state.Redo() && state.menuPatch == puffOnly && state.Undo(),
+              "puff-editor-only history lost settings or saved baseline");
+        auto disabledEditorOrder = selectedMenu;
+        disabledEditorOrder.enabledItems &= ~FirmwareMenu::PuffEditorMask;
+        disabledEditorOrder.order = {FirmwareMenu::Item::PuffEditor, FirmwareMenu::Item::Exit,
+            FirmwareMenu::Item::Information, FirmwareMenu::Item::Voltage};
+        state.PushUndo("Disabled puff editor ordering");
+        state.SetMenuPatch(disabledEditorOrder);
+        state.EndUndoAction();
+        state.MarkSaved();
+        auto reorderedEditor = disabledEditorOrder;
+        std::swap(reorderedEditor.order[0], reorderedEditor.order[1]);
+        state.PushUndo("Reorder disabled puff editor");
+        state.SetMenuPatch(reorderedEditor);
+        state.EndUndoAction();
+        check(state.HasUnsavedChanges() && state.Undo() &&
+              state.menuPatch == disabledEditorOrder && !state.HasUnsavedChanges() &&
+              state.Redo() && state.menuPatch == reorderedEditor && state.HasUnsavedChanges(),
+              "disabled editor ordering was omitted from history or saved baseline");
+        state.Undo();
+        state.Undo();
+        state.MarkSaved();
+        state.PushUndo("Menu navigation");
+        auto defaultNavigation = selectedMenu;
+        defaultNavigation.reverseNavigation = false;
+        state.SetMenuPatch(defaultNavigation);
+        check(!state.CanRedo() && state.HasUnsavedChanges(), "menu navigation change retained stale redo or clean cache");
+        StudioState replacement;
+        FirmwarePackage replacementPackage;
+        if (LoadEmbeddedFirmware(replacementPackage, loadError) &&
+            replacement.LoadPackage(std::move(replacementPackage), "replacement", loadError)) {
+            state.AdoptLoadedDocument(replacement);
+            check(state.menuPatch == FirmwareMenu::Settings{} &&
+                  state.originalMenuPatch == FirmwareMenu::Settings{} &&
+                  state.savedMenuPatch == FirmwareMenu::Settings{} &&
+                  !state.HasUnsavedChanges() && !state.CanUndo() && !state.CanRedo(),
+                  "document adoption retained menu settings or history");
+        } else check(false, "menu replacement document fixture failed");
     } else check(false, "embedded firmware unavailable for reload regression");
     return error.empty();
 }

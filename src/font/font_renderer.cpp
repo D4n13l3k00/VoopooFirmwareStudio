@@ -33,7 +33,7 @@ FontRenderer::~FontRenderer() {
     }
 }
 
-bool FontRenderer::LoadFontFile(const std::string& path) {
+bool FontRenderer::LoadFontFile(const std::string& path, int faceIndex) {
     auto file = PathUtils::OpenReadStream(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         m_loaded = false;
@@ -49,7 +49,8 @@ bool FontRenderer::LoadFontFile(const std::string& path) {
     }
 
     stbtt_fontinfo* info = (stbtt_fontinfo*)m_fontInfo;
-    if (!stbtt_InitFont(info, m_fontBuffer.data(), stbtt_GetFontOffsetForIndex(m_fontBuffer.data(), 0))) {
+    const int offset = stbtt_GetFontOffsetForIndex(m_fontBuffer.data(), faceIndex);
+    if (offset < 0 || !stbtt_InitFont(info, m_fontBuffer.data(), offset)) {
         m_loaded = false;
         return false;
     }
@@ -198,7 +199,18 @@ int FontRenderer::ComputeCommonBaseline(const std::vector<char>& chars, float fo
     return opts.target_height / 2;
 }
 
-std::pair<float, std::vector<RenderedGlyph>> FontRenderer::RenderPreset(const Preset& preset, const RenderOptions& opts) {
+std::pair<float, std::vector<RenderedGlyph>> FontRenderer::RenderPreset(const Preset& preset, const RenderOptions& nativeOpts) {
+    RenderOptions opts = nativeOpts;
+    const int rotation = preset.rotationQuarterTurns & 3;
+    if (rotation & 1) std::swap(opts.target_width, opts.target_height);
+    const auto pixelIndex = [&](int x, int y) -> size_t {
+        switch (rotation) {
+        case 1: return size_t(x) * nativeOpts.target_width + opts.target_height - 1 - y;
+        case 2: return size_t(opts.target_height - 1 - y) * nativeOpts.target_width + opts.target_width - 1 - x;
+        case 3: return size_t(opts.target_width - 1 - x) * nativeOpts.target_width + y;
+        default: return size_t(y) * nativeOpts.target_width + x;
+        }
+    };
     std::vector<RenderedGlyph> result;
     if (!m_loaded) return { 0.0f, result };
 
@@ -224,8 +236,8 @@ std::pair<float, std::vector<RenderedGlyph>> FontRenderer::RenderPreset(const Pr
         RenderedGlyph rg;
         rg.ch = gdef.ch;
         rg.filename = gdef.filename;
-        rg.width = opts.target_width;
-        rg.height = opts.target_height;
+        rg.width = nativeOpts.target_width;
+        rg.height = nativeOpts.target_height;
         rg.pixels.assign(opts.target_width * opts.target_height, 0);
 
         RawBitmap raw = RasterizeChar(info, gdef.ch, font_size, opts.oversample, opts.threshold);
@@ -233,8 +245,8 @@ std::pair<float, std::vector<RenderedGlyph>> FontRenderer::RenderPreset(const Pr
         if (GetActiveBBox(raw, min_x, min_y, max_x, max_y)) {
             int act_w = max_x - min_x + 1;
             int act_h = max_y - min_y + 1;
-            rg.active_width = act_w;
-            rg.active_height = act_h;
+            rg.active_width = (rotation & 1) ? act_h : act_w;
+            rg.active_height = (rotation & 1) ? act_w : act_h;
 
             if (opts.stretch && act_w > 0 && act_h > 0) {
                 int draw_w = (std::max)(1, opts.target_width - opts.padding_x * 2);
@@ -248,7 +260,7 @@ std::pair<float, std::vector<RenderedGlyph>> FontRenderer::RenderPreset(const Pr
                             int out_x = opts.padding_x + dx;
                             int out_y = opts.padding_y + dy;
                             if (out_x >= 0 && out_x < opts.target_width && out_y >= 0 && out_y < opts.target_height) {
-                                rg.pixels[out_y * opts.target_width + out_x] = 255;
+                                rg.pixels[pixelIndex(out_x, out_y)] = 255;
                             }
                         }
                     }
@@ -270,7 +282,7 @@ std::pair<float, std::vector<RenderedGlyph>> FontRenderer::RenderPreset(const Pr
                             int out_x = gx + offset_x;
                             int out_y = gy + offset_y;
                             if (out_x >= 0 && out_x < opts.target_width && out_y >= 0 && out_y < opts.target_height) {
-                                rg.pixels[out_y * opts.target_width + out_x] = 255;
+                                rg.pixels[pixelIndex(out_x, out_y)] = 255;
                             }
                         }
                     }
@@ -311,30 +323,3 @@ bool FontRenderer::SaveGlyphs(const std::vector<RenderedGlyph>& glyphs, const st
     return true;
 }
 
-std::vector<SystemFont> FontRenderer::ListPopularWindowsFonts() {
-    std::vector<SystemFont> result;
-    const std::pair<const char*, const char*> popular[] = {
-        { "Impact", "impact.ttf" },
-        { "Consolas Bold", "consolab.ttf" },
-        { "Consolas Regular", "consola.ttf" },
-        { "Arial Bold", "arialbd.ttf" },
-        { "Arial Regular", "arial.ttf" },
-        { "Segoe UI Bold", "segoeuib.ttf" },
-        { "Segoe UI Regular", "segoeui.ttf" },
-        { "Bahnschrift (DIN)", "bahnschrift.ttf" },
-        { "Verdana Bold", "verdanab.ttf" },
-        { "Trebuchet MS Bold", "trebucbd.ttf" },
-    };
-
-    char winDir[MAX_PATH];
-    if (GetWindowsDirectoryA(winDir, MAX_PATH)) {
-        fs::path fontsDir = fs::path(winDir) / "Fonts";
-        for (const auto& item : popular) {
-            fs::path p = fontsDir / item.second;
-            if (fs::exists(p)) {
-                result.push_back({ item.first, p.string() });
-            }
-        }
-    }
-    return result;
-}

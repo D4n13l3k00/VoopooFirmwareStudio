@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include "firmware_catalog.h"
 
 struct GlyphDef {
     char ch;
@@ -13,10 +14,12 @@ struct Preset {
     int width;
     int height;
     std::vector<GlyphDef> glyphs;
+    int rotationQuarterTurns = 0;
 
     static Preset font_19x40();
     static Preset font_11x20();
     static Preset font_7x13();
     static Preset font_6x10();
-    static std::vector<Preset> all();
+    static std::vector<Preset> all(FirmwareModel model = FirmwareModel::DragS,
+        FirmwareEdition edition = FirmwareEdition::Score);
 };

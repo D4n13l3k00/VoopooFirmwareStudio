@@ -12,6 +12,8 @@
     <RootNamespace>VoopooFirmwareStudio</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
     <VCProjectVersion>17.0</VCProjectVersion>
+    <StudioVersion Condition="'$(StudioVersion)'==''">2.0.0</StudioVersion>
+    <StudioVersionTuple>$([System.String]::Copy('$(StudioVersion)').Replace('.', ',')),0</StudioVersionTuple>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
@@ -41,18 +43,19 @@
       <ExceptionHandling>Sync</ExceptionHandling>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\font;$(ProjectDir)src\ui;$(ProjectDir)src\utils;$(ProjectDir)imgui;$(ProjectDir)imgui\backends;$(ProjectDir)third_party;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>NDEBUG;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\font;$(ProjectDir)src\ui;$(ProjectDir)src\utils;$(ProjectDir)imgui;$(ProjectDir)imgui\backends;$(ProjectDir)third_party;$(ProjectDir)build\deps\unicorn-2.1.4\include;$(ProjectDir)build\deps\xz-5.8.1\src\liblzma\api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>NDEBUG;_CRT_SECURE_NO_WARNINGS;LZMA_API_STATIC;STUDIO_VERSION="$(StudioVersion)";%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)build\deps\unicorn-build\Release\unicorn.lib;$(ProjectDir)build\deps\xz-build\Release\lzma.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;shell32.lib;ole32.lib;dwmapi.lib;winhttp.lib;bcrypt.lib;windowsapp.lib;advapi32.lib;dwrite.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>STUDIO_VERSION_TEXT=$(StudioVersion);STUDIO_VERSION_TUPLE=$(StudioVersionTuple);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -60,18 +63,48 @@
     <ClCompile Include="src\core\firmware_bitmap.cpp" />
     <ClCompile Include="src\core\firmware_catalog.cpp" />
     <ClCompile Include="src\core\firmware_color.cpp" />
+    <ClCompile Include="src\core\firmware_comparison.cpp" />
+    <ClCompile Include="src\core\firmware_emulator.cpp" />
+    <ClCompile Include="src\core\firmware_emulator_runtime.cpp" />
+    <ClCompile Include="src\core\firmware_emulator_screens.cpp" />
+    <ClCompile Include="src\core\firmware_emulator_legacy.cpp" />
+    <ClCompile Include="src\core\firmware_emulator_drag3.cpp" />
+    <ClCompile Include="src\core\firmware_emulator_pro_plus.cpp" />
+    <ClCompile Include="src\core\firmware_layout.cpp" />
+    <ClCompile Include="src\core\firmware_layout_sx.cpp" />
+    <ClCompile Include="src\core\firmware_layout_drag2.cpp" />
+    <ClCompile Include="src\core\firmware_layout_sx_pages.cpp" />
+    <ClCompile Include="src\core\firmware_layout_legacy.cpp" />
+    <ClCompile Include="src\core\firmware_layout_three_max.cpp" />
+    <ClCompile Include="src\core\firmware_layout_pro_plus.cpp" />
+    <ClCompile Include="src\core\firmware_project.cpp" />
+    <ClCompile Include="src\core\firmware_preview.cpp" />
+    <ClCompile Include="src\font\font_catalog.cpp" />
     <ClCompile Include="src\core\zwdf_package.cpp" />
+    <ClCompile Include="src\core\xwdf_codec.cpp" />
     <ClCompile Include="src\font\font_renderer.cpp">
       </ClCompile>
     <ClCompile Include="src\font\presets.cpp">
       </ClCompile>
     <ClCompile Include="src\ui\ui_firmware_info.cpp" />
+    <ClCompile Include="src\ui\ui_firmware_comparison.cpp" />
+    <ClCompile Include="src\ui\ui_firmware_emulator.cpp" />
+    <ClCompile Include="src\ui\ui_firmware_patches.cpp" />
+    <ClCompile Include="src\ui\ui_firmware_layout.cpp" />
+    <ClCompile Include="src\ui\ui_app_update.cpp" />
+    <ClCompile Include="src\ui\ui_settings.cpp" />
+    <ClCompile Include="src\ui\window_chrome.cpp" />
+    <ClCompile Include="src\ui\ui_markdown.cpp" />
     <ClCompile Include="src\ui\ui_font_generator.cpp">
       </ClCompile>
     <ClCompile Include="src\ui\ui_palette.cpp" />
     <ClCompile Include="src\ui\ui_pixel_editor.cpp" />
     <ClCompile Include="src\ui\ui_resource_studio.cpp" />
+    <ClCompile Include="src\utils\app_update.cpp" />
+    <ClCompile Include="src\utils\app_update_install.cpp" />
     <ClCompile Include="src\utils\i18n.cpp" />
+    <ClCompile Include="src\utils\studio_preferences.cpp" />
+    <ClCompile Include="src\utils\resource_i18n.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />
@@ -79,27 +112,151 @@
     <ClCompile Include="imgui\imgui_widgets.cpp" />
     <ClCompile Include="imgui\backends\imgui_impl_dx11.cpp" />
     <ClCompile Include="imgui\backends\imgui_impl_win32.cpp" />
+    <ClCompile Include="third_party\markdown\imgui_md.cpp" />
+    <ClCompile Include="third_party\markdown\md4c.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <LanguageStandard>Default</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+    </ClCompile>
+    <ClCompile Include="third_party\markdown\entity.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <LanguageStandard>Default</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+    </ClCompile>
+    <ClCompile Include="src\core\pro_firmware.cpp" />
+    <ClCompile Include="src\core\plus_firmware.cpp" />
+    <ClCompile Include="src\core\three_max_firmware.cpp" />
+    <ClCompile Include="src\core\legacy_firmware.cpp" />
+    <ClCompile Include="src\core\firmware_logo_patch.cpp" />
+    <ClCompile Include="src\core\firmware_menu_patch.cpp" />
+    <ClCompile Include="src\ui\ui_firmware_menu.cpp" />
+    <ClCompile Include="src\core\firmware_device.cpp" />
+    <ClCompile Include="src\core\firmware_device_worker.cpp" />
+    <ClCompile Include="src\ui\ui_firmware_device.cpp" />
+    <ClCompile Include="src\ui\ui_startup.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="tests\editor_regressions.h" />
     <ClInclude Include="tests\firmware_color_audit.h" />
     <ClInclude Include="tests\history_regressions.h" />
     <ClInclude Include="tests\save_regressions.h" />
+    <ClInclude Include="tests\model_regressions.h" />
+    <ClInclude Include="tests\xwdf_regressions.h" />
+    <ClInclude Include="tests\factory_regressions.h" />
     <ClInclude Include="src\core\app_state.h" />
     <ClInclude Include="src\core\embedded_firmware.h" />
     <ClInclude Include="src\core\firmware_bitmap.h" />
     <ClInclude Include="src\core\firmware_catalog.h" />
     <ClInclude Include="src\core\firmware_color.h" />
+    <ClInclude Include="src\core\firmware_comparison.h" />
+    <ClInclude Include="src\core\firmware_emulator.h" />
+    <ClInclude Include="src\core\firmware_emulator_runtime.h" />
+    <ClInclude Include="src\core\firmware_emulator_screens.h" />
+    <ClInclude Include="src\core\firmware_emulator_sx_screens.h" />
+    <ClInclude Include="src\core\firmware_emulator_sx_score.h" />
+    <ClInclude Include="src\core\firmware_emulator_sx_factory.h" />
+    <ClInclude Include="src\core\firmware_emulator_backend.h" />
+    <ClInclude Include="src\core\firmware_color_profiles.h" />
+    <ClInclude Include="src\core\factory_color_profiles.h" />
+    <ClInclude Include="src\core\factory_catalog.h" />
     <ClInclude Include="src\core\zwdf_package.h" />
+    <ClInclude Include="src\core\firmware_layout.h" />
+    <ClInclude Include="src\core\firmware_layout_sx_pages_private.h" />
+    <ClInclude Include="src\core\firmware_layout_sx_pages_data.h" />
+    <ClInclude Include="src\core\firmware_layout_legacy_private.h" />
+    <ClInclude Include="src\core\firmware_layout_legacy_pages.h" />
+    <ClInclude Include="src\core\firmware_legacy_loader_data.h" />
+    <ClInclude Include="src\core\firmware_three_max_profiles.h" />
+    <ClInclude Include="src\core\firmware_three_max_layout_profiles.h" />
+    <ClInclude Include="src\core\firmware_pro_plus_native.h" />
+    <ClInclude Include="src\core\firmware_pro_plus_layout_data.h" />
+    <ClInclude Include="src\core\firmware_three_max_semantic_profiles.h" />
+    <ClInclude Include="src\core\xwdf_codec.h" />
+    <ClInclude Include="src\core\drag2_color.h" />
     <ClInclude Include="src\font\font_renderer.h" />
     <ClInclude Include="src\font\presets.h" />
     <ClInclude Include="src\ui\ui_firmware_info.h" />
+    <ClInclude Include="src\ui\ui_firmware_comparison.h" />
+    <ClInclude Include="src\ui\ui_firmware_emulator.h" />
+    <ClInclude Include="src\ui\ui_firmware_patches.h" />
+    <ClInclude Include="src\ui\ui_collapsible_section.h" />
+    <ClInclude Include="src\ui\ui_tabs.h" />
+    <ClInclude Include="src\ui\ui_controls.h" />
+    <ClInclude Include="src\ui\ui_keyboard.h" />
+    <ClInclude Include="src\ui\ui_preview_split.h" />
+    <ClInclude Include="src\ui\ui_modal_transition.h" />
+    <ClInclude Include="src\ui\patch_playback.h" />
+    <ClInclude Include="tests\patch_playback_regressions.h" />
+    <ClInclude Include="tests\native_effect_regressions.h" />
+    <ClInclude Include="tests\async_file_regressions.h" />
+    <ClInclude Include="tests\modal_motion_regressions.h" />
+    <ClInclude Include="tests\preferences_regressions.h" />
+    <ClInclude Include="tests\ui_capture.h" />
+    <ClInclude Include="src\ui\ui_firmware_layout.h" />
+    <ClInclude Include="src\ui\ui_app_update.h" />
+    <ClInclude Include="src\ui\ui_settings.h" />
+    <ClInclude Include="src\utils\studio_preferences.h" />
+    <ClInclude Include="src\ui\window_chrome.h" />
+    <ClInclude Include="src\ui\ui_markdown.h" />
+    <ClInclude Include="third_party\markdown\imgui_md.h" />
+    <ClInclude Include="third_party\markdown\md4c.h" />
+    <ClInclude Include="third_party\markdown\entity.h" />
+    <ClInclude Include="tests\comparison_regressions.h" />
+    <ClInclude Include="tests\emulator_regressions.h" />
+    <ClInclude Include="tests\layout_regressions.h" />
+    <ClInclude Include="tests\native_coverage_regressions.h" />
+    <ClInclude Include="tests\sx_page_layout_regressions.h" />
+    <ClInclude Include="tests\legacy_coverage_regressions.h" />
+    <ClInclude Include="tests\three_max_coverage_regressions.h" />
+    <ClInclude Include="tests\pro_plus_coverage_regressions.h" />
+    <ClInclude Include="tests\project_regressions.h" />
+    <ClInclude Include="src\core\firmware_logo_patch.h" />
+    <ClInclude Include="src\core\firmware_menu_patch.h" />
+    <ClInclude Include="src\core\firmware_menu_executor.inc" />
+    <ClInclude Include="src\core\firmware_menu_puff_profiles.inc" />
+    <ClInclude Include="src\core\firmware_menu_visuals.inc" />
+    <ClInclude Include="src\core\firmware_menu_profiles.inc" />
+    <ClInclude Include="src\ui\ui_firmware_menu.h" />
+    <ClInclude Include="tests\device_menu_regressions.h" />
+    <ClInclude Include="tests\device_puff_editor_regressions.h" />
+    <ClInclude Include="tests\device_achievement_regressions.h" />
+    <ClInclude Include="tests\device_menu_hold_regressions.h" />
+    <ClInclude Include="src\core\firmware_logo_executor.inc" />
+    <ClInclude Include="src\core\firmware_logo_preview.h" />
+    <ClInclude Include="src\core\firmware_device.h" />
+    <ClInclude Include="src\core\firmware_device_regression.h" />
+    <ClInclude Include="src\core\firmware_device_worker.h" />
+    <ClInclude Include="src\ui\ui_firmware_device.h" />
+    <ClInclude Include="tests\device_regressions.h" />
+    <ClInclude Include="tests\device_matrix_regressions.h" />
+    <ClInclude Include="tests\device_custom_info_regressions.h" />
+    <ClInclude Include="tests\device_diagnostics_ui_regressions.h" />
+    <ClInclude Include="tests\async_preview_regressions.h" />
+    <ClInclude Include="tests\device_worker_regressions.h" />
+    <ClInclude Include="tests\device_input_regressions.h" />
+    <ClInclude Include="tests\unicorn_jit_regressions.h" />
+    <ClInclude Include="tests\preview_regressions.h" />
+    <ClInclude Include="tests\layout_geometry_regressions.h" />
+    <ClInclude Include="tests\layout_selection_regressions.h" />
+    <ClInclude Include="src\core\layout_edit_selection.h" />
+    <ClInclude Include="src\core\firmware_project.h" />
+    <ClInclude Include="src\core\firmware_preview.h" />
+    <ClInclude Include="src\core\layout_geometry.h" />
+    <ClInclude Include="tests\app_update_regressions.h" />
     <ClInclude Include="src\ui\ui_font_generator.h" />
     <ClInclude Include="src\ui\ui_palette.h" />
     <ClInclude Include="tests\editor_regressions.h" />
     <ClInclude Include="src\ui\ui_pixel_editor.h" />
     <ClInclude Include="src\ui\ui_resource_studio.h" />
+    <ClInclude Include="src\utils\app_update.h" />
+    <ClInclude Include="src\utils\app_update_install.h" />
     <ClInclude Include="src\utils\i18n.h" />
+    <ClInclude Include="src\utils\resource_i18n.h" />
+    <ClInclude Include="src\utils\resource_i18n_ru_uk_be.inc" />
+    <ClInclude Include="src\utils\resource_i18n_pl_de_ro.inc" />
+    <ClInclude Include="src\utils\resource_i18n_es_fr_uz.inc" />
+    <ClInclude Include="src\utils\resource_i18n_kk_az_ky.inc" />
+    <ClInclude Include="src\utils\resource_i18n_tg_hy_ka.inc" />
     <ClInclude Include="src\utils\path_utils.h" />
     <ClInclude Include="src\utils\atomic_file.h" />
     <ClInclude Include="src\utils\firmware_save.h" />
@@ -112,12 +269,53 @@
     <ClInclude Include="imgui\imstb_truetype.h" />
     <ClInclude Include="imgui\backends\imgui_impl_dx11.h" />
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />
+    <ClInclude Include="src\core\firmware_profiles.h" />
+    <ClInclude Include="tests\native_profile_regressions.h" />
+    <ClInclude Include="src\core\firmware_extensions.h" />
+    <ClInclude Include="src\core\pro_firmware.h" />
+    <ClInclude Include="src\core\plus_firmware.h" />
+    <ClInclude Include="src\core\three_max_firmware.h" />
+    <ClInclude Include="src\core\legacy_firmware.h" />
+    <ClInclude Include="src\ui\ui_startup.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="assets\firmware.rc" />
   </ItemGroup>
   <ItemGroup>
+    <Image Include="VoopooFirmwareStudio.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="third_party\markdown\imgui_md.LICENSE" />
+    <None Include="src\core\firmware_logo_boot.S" />
+    <None Include="src\core\firmware_menu_boot.S" />
+    <None Include="scripts\generate_menu_executor.py" />
+    <None Include="third_party\unicorn-thumb-hooks-before.inc" />
+    <None Include="third_party\unicorn-thumb-hooks-after.inc" />
+    <None Include="third_party\markdown\md4c.LICENSE" />
+    <None Include="third_party\xz.LICENSE" />
     <None Include="assets\base_firmware.zwdf" />
+    <None Include="assets\drag_x_firmware.zwdf" />
+    <None Include="assets\drag_2_firmware.xwdf" />
+    <None Include="assets\drag_s_factory_firmware.zwdf" />
+    <None Include="assets\drag_x_factory_firmware.zwdf" />
+    <None Include="assets\drag_s_pro_factory_firmware.swdf" />
+    <None Include="assets\drag_s_pro_tc_firmware.zwdf" />
+    <None Include="assets\drag_x_pro_tc_firmware.zwdf" />
+    <None Include="assets\drag_x_plus_factory_firmware.zwdf" />
+    <None Include="assets\drag_x_plus_tc_firmware.zwdf" />
+    <None Include="assets\drag_x_plus_pro_tc_firmware.zwdf" />
+    <None Include="assets\drag_3_factory_firmware.zwdf" />
+    <None Include="assets\drag_3_tc_firmware.zwdf" />
+    <None Include="assets\drag_max_firmware.swdf" />
+    <None Include="assets\drag_1_firmware.xwdf" />
+    <None Include="assets\drag_mini_v1_firmware.xwdf" />
+    <None Include="assets\drag_mini_v2_firmware.xwdf" />
+    <None Include="assets\drag_2_refresh_firmware.swdf" />
+    <None Include="assets\drag_2_fit3_firmware.swdf" />
+    <None Include="assets\drag_mini_refresh_firmware.swdf" />
+    <None Include="assets\drag_mini_fit3_firmware.swdf" />
+    <None Include="assets\devices\*.png" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="VoopooFirmwareStudio.Dependencies.targets" />
 </Project>

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 
 namespace AtomicFile {
@@ -38,8 +39,10 @@ inline bool SameFile(HANDLE a, HANDLE b, bool& same, Error& error) {
 // This also prevents a source alias being substituted between check and commit.
 inline bool Write(const std::filesystem::path& destination, const void* data, size_t size,
                   bool backup, Error& error, const std::filesystem::path& protectedSource = {},
-                  const std::filesystem::path& protectedOutput = {}) {
+                  const std::filesystem::path& protectedOutput = {},
+                  const std::function<void(const char*)>& progress = {}) {
     error = {};
+    if (progress) progress("Check safe-write destination and protected source identity");
     Handle source, output;
     const std::filesystem::path* protectedPaths[] = {&protectedSource, &protectedOutput};
     Handle* protectedHandles[] = {&source, &output};
@@ -76,6 +79,7 @@ inline bool Write(const std::filesystem::path& destination, const void* data, si
         }
     }
 
+    if (progress) progress("Create same-directory temporary file");
     static std::atomic<unsigned long> sequence{0};
     std::filesystem::path temporary;
     Handle file;
@@ -115,6 +119,7 @@ inline bool Write(const std::filesystem::path& destination, const void* data, si
         error = {stage, code};
         return false;
     };
+    if (progress) progress("Write temporary file");
     const auto* bytes = static_cast<const uint8_t*>(data);
     size_t offset = 0;
     while (offset < size) {
@@ -126,12 +131,15 @@ inline bool Write(const std::filesystem::path& destination, const void* data, si
         if (written == 0) return fail(Stage::Write, ERROR_WRITE_FAULT);
         offset += written;
     }
+    if (progress) progress("Flush temporary file to disk");
     if (!FlushFileBuffers(file.value)) return fail(Stage::Flush, GetLastError());
+    if (progress) progress("Close temporary file");
     const HANDLE closing = file.value;
     file.value = INVALID_HANDLE_VALUE;
     if (!CloseHandle(closing)) return fail(Stage::Close, GetLastError());
 
     if (backup && exists) {
+        if (progress) progress("Back up existing destination");
         auto backupPath = destination;
         backupPath += L".bak." + PathUtils::Utf8ToWide(PathUtils::FormatTimestampNow()) + L"." +
                       std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(sequence.fetch_add(1));
@@ -148,6 +156,7 @@ inline bool Write(const std::filesystem::path& destination, const void* data, si
     }
     // Same-directory rename never truncates the destination. Do not fall back to
     // copying/deleting if replacement is denied (locks, read-only files, etc.).
+    if (progress) progress("Atomically replace destination");
     if (!MoveFileExW(temporary.c_str(), destination.c_str(),
                      (exists ? MOVEFILE_REPLACE_EXISTING : 0) | MOVEFILE_WRITE_THROUGH))
         return fail(Stage::Commit, GetLastError());

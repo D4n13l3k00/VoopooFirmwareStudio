@@ -29,6 +29,8 @@ struct RenderedGlyph {
 struct SystemFont {
     std::string name;
     std::string path;
+    bool userInstalled = false;
+    int faceIndex = 0;
 };
 
 class FontRenderer {
@@ -36,13 +38,13 @@ public:
     FontRenderer();
     ~FontRenderer();
 
-    bool LoadFontFile(const std::string& path);
+    bool LoadFontFile(const std::string& path, int faceIndex = 0);
     bool IsLoaded() const { return m_loaded; }
     const std::string& GetLoadedPath() const { return m_fontPath; }
 
     std::pair<float, std::vector<RenderedGlyph>> RenderPreset(const Preset& preset, const RenderOptions& opts);
     static bool SaveGlyphs(const std::vector<RenderedGlyph>& glyphs, const std::string& out_dir, std::string& err_msg);
-    static std::vector<SystemFont> ListPopularWindowsFonts();
+    static std::vector<SystemFont> ListInstalledFonts(std::string& error);
 
 private:
     float FindOptimalFontSize(const std::vector<char>& chars, int target_w, int target_h, int pad_x, int pad_y, int oversample, uint8_t threshold, bool stretch);

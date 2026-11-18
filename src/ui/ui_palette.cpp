@@ -22,7 +22,9 @@ void RenderPaletteEditor(StudioState& studio) {
     if (ImGui::Combo("##PaletteThemeSelect", &selThemeIdx, themeNames.data(), (int)themeNames.size())) {
         ApplyPaletteTheme(studio, themes[selThemeIdx]);
     }
-    ImGui::TextDisabled("%s", GetThemeDescTr((size_t)selThemeIdx));
+    if (selThemeIdx == 0)
+        ImGui::TextDisabled("%s / %s", FirmwareModelName(studio.model), FirmwareEditionName(studio.edition));
+    else ImGui::TextDisabled("%s", GetThemeDescTr((size_t)selThemeIdx));
 
     float themeBtnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
     if (ImGui::Button(Tr(i18n::Str::BtnApply), ImVec2(themeBtnW, 0))) {
@@ -37,7 +39,7 @@ void RenderPaletteEditor(StudioState& studio) {
 
     std::vector<const char*> palLabels;
     for (const auto& p : studio.palette) {
-        palLabels.push_back(GetRoleLabelTr(p.spec.id));
+            palLabels.push_back((studio.edition == FirmwareEdition::Factory || FirmwareExtensionFor(studio.model)) ? p.spec.label : GetRoleLabelTr(p.spec.id));
     }
     int palIdx = (int)studio.selectedPaletteIdx;
     ImGui::Text("%s:", Tr(i18n::Str::LabelRole));
@@ -49,7 +51,7 @@ void RenderPaletteEditor(StudioState& studio) {
     }
 
     auto& curEntry = studio.palette[studio.selectedPaletteIdx];
-    ImGui::TextDisabled("%s", GetRoleScopeTr(curEntry.spec.id));
+        ImGui::TextWrapped("%s", (studio.edition == FirmwareEdition::Factory || FirmwareExtensionFor(studio.model)) ? curEntry.spec.scope : GetRoleScopeTr(curEntry.spec.id));
 
     // Color swatch & Hex input & Reset Role button
     Rgb8 sCol = curEntry.current.ScreenColor();

@@ -1,3 +1,4 @@
+#include "ui_tabs.h"
 #include "../imgui/imgui.h"
 #include "../imgui/backends/imgui_impl_win32.h"
 #include "../imgui/backends/imgui_impl_dx11.h"
@@ -7,7 +8,10 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <new>
+#include <psapi.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <map>
 #include <filesystem>
@@ -29,13 +33,60 @@
 #include "i18n.h"
 
 #include "ui_resource_studio.h"
+#include "ui_firmware_comparison.h"
+#include "ui_firmware_emulator.h"
+#include "ui_firmware_patches.h"
+#include "ui_firmware_layout.h"
+#include "ui_firmware_menu.h"
+#include "ui_app_update.h"
+#include "studio_preferences.h"
+#include "ui_settings.h"
+#include "window_chrome.h"
+#include "ui_keyboard.h"
 #include "../tests/editor_regressions.h"
+#include "../tests/comparison_regressions.h"
+#include "../tests/emulator_regressions.h"
+#include "../tests/layout_regressions.h"
+#include "../tests/native_coverage_regressions.h"
+#include "../tests/sx_page_layout_regressions.h"
+#include "../tests/legacy_coverage_regressions.h"
+#include "../tests/three_max_coverage_regressions.h"
+#include "../tests/pro_plus_coverage_regressions.h"
+#include "../tests/device_regressions.h"
+#include "../tests/device_custom_info_regressions.h"
+#include "../tests/device_menu_regressions.h"
+#include "../tests/device_puff_editor_regressions.h"
+#include "../tests/device_achievement_regressions.h"
+#include "../tests/device_menu_hold_regressions.h"
+#include "../tests/device_diagnostics_ui_regressions.h"
+#include "../tests/async_preview_regressions.h"
+#include "../tests/device_worker_regressions.h"
+#include "../tests/device_input_regressions.h"
+#include "../tests/unicorn_jit_regressions.h"
+#include "../tests/project_regressions.h"
+#include "../tests/flash_usage_regressions.h"
+#include "../tests/patch_playback_regressions.h"
+#include "../tests/native_effect_regressions.h"
+#include "../tests/async_file_regressions.h"
+#include "../tests/modal_motion_regressions.h"
+#include "../tests/preferences_regressions.h"
+#include "../tests/menu_preview_ui_regressions.h"
+#include "../tests/preview_regressions.h"
+#include "../tests/layout_geometry_regressions.h"
+#include "../tests/layout_selection_regressions.h"
+#include "../tests/app_update_regressions.h"
 #include "../tests/firmware_color_audit.h"
 #include "../tests/history_regressions.h"
 #include "../tests/save_regressions.h"
+#include "../tests/model_regressions.h"
+#include "../tests/xwdf_regressions.h"
+#include "../tests/factory_regressions.h"
+#include "ui_startup.h"
+#include "../tests/native_profile_regressions.h"
 #include "ui_firmware_info.h"
 
 #include "ui_font_generator.h"
+#include "ui_firmware_risk.h"
 
 
 #pragma comment(lib, "d3d11.lib")
@@ -77,17 +128,225 @@ static LONG WINAPI GlobalCrashHandler(EXCEPTION_POINTERS* pEx) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
-    const bool smokeTest = std::wstring(commandLine).find(L"--smoke-test") != std::wstring::npos;
-    const bool enableDebugLog = smokeTest || std::wstring(commandLine).find(L"--debug") != std::wstring::npos;
+    const std::wstring_view args(commandLine);
+    const bool smokeTest = args.find(L"--smoke-test") != args.npos;
+    const bool layoutTest = args.find(L"--layout-test") != args.npos;
+    const bool projectTest = args.find(L"--project-test") != args.npos;
+    const auto coverageArgument = args.find(L"--coverage-test=");
+    const bool coverageTest = coverageArgument != args.npos;
+    auto coverageFamily = coverageTest ? args.substr(coverageArgument + 16) : std::wstring_view{};
+    coverageFamily = coverageFamily.substr(0, coverageFamily.find_first_of(L" \t"));
+    const bool enableDebugLog = smokeTest || layoutTest || projectTest || coverageTest || args.find(L"--debug") != args.npos;
     SetUnhandledExceptionFilter(GlobalCrashHandler);
     i18n::InitI18n();
     std::ofstream logF;
     if (enableDebugLog) {
         logF.open("studio_debug.log");
     }
-    logF << "Starting Voopoo DRAG S Studio...\n" << std::flush;
+    logF << "Starting Voopoo Firmware Studio...\n" << std::flush;
 
     try {
+        if (coverageTest) {
+            constexpr std::wstring_view layoutPrefix = L"layout-profile-";
+            if (coverageFamily.starts_with(layoutPrefix)) {
+                const auto suffix = coverageFamily.substr(layoutPrefix.size());
+                size_t index = 0;
+                if (suffix.empty()) return 37;
+                for (const wchar_t digit : suffix) {
+                    if (digit < L'0' || digit > L'9') return 37;
+                    index = index * 10 + size_t(digit - L'0');
+                    if (index >= FirmwareProfiles().size()) return 37;
+                }
+                std::string error;
+                if (!RunLayoutRegressions(error, &logF, &FirmwareProfiles()[index])) {
+                    logF << "LAYOUT REGRESSIONS FAILED: " << error << std::endl;
+                    return 31;
+                }
+                return 0;
+            }
+            // Split the same native framebuffer matrix across processes without
+            // reducing coverage or making the normal "all" family run it twice.
+            struct EffectShard {
+                std::wstring_view name;
+                FirmwareEdition edition;
+                FirmwareLogo::Animation effect;
+            };
+            constexpr EffectShard shards[] = {
+                {L"screen-effects-score-10", FirmwareEdition::Score, FirmwareLogo::Animation::SoftWipe},
+                {L"screen-effects-score-11", FirmwareEdition::Score, FirmwareLogo::Animation::SlideRight},
+                {L"screen-effects-score-12", FirmwareEdition::Score, FirmwareLogo::Animation::Checker},
+                {L"screen-effects-score-13", FirmwareEdition::Score, FirmwareLogo::Animation::Diagonal},
+                {L"screen-effects-factory-10", FirmwareEdition::Factory, FirmwareLogo::Animation::SoftWipe},
+                {L"screen-effects-factory-11", FirmwareEdition::Factory, FirmwareLogo::Animation::SlideRight},
+                {L"screen-effects-factory-12", FirmwareEdition::Factory, FirmwareLogo::Animation::Checker},
+                {L"screen-effects-factory-13", FirmwareEdition::Factory, FirmwareLogo::Animation::Diagonal},
+                {L"screen-effects-score-14", FirmwareEdition::Score, FirmwareLogo::Animation::SlideLeft},
+                {L"screen-effects-score-15", FirmwareEdition::Score, FirmwareLogo::Animation::SlideUp},
+                {L"screen-effects-score-16", FirmwareEdition::Score, FirmwareLogo::Animation::SlideDown},
+                {L"screen-effects-factory-14", FirmwareEdition::Factory, FirmwareLogo::Animation::SlideLeft},
+                {L"screen-effects-factory-15", FirmwareEdition::Factory, FirmwareLogo::Animation::SlideUp},
+                {L"screen-effects-factory-16", FirmwareEdition::Factory, FirmwareLogo::Animation::SlideDown},
+            };
+            for (const auto& shard : shards) {
+                if (coverageFamily != shard.name) continue;
+                std::string error;
+                if (!RunNativeEffectShard(error, &logF, shard.effect, int(shard.edition))) {
+                    logF << "NATIVE EFFECT SHARD FAILED: " << error << std::endl;
+                    return 36;
+                }
+                return 0;
+            }
+            struct CoverageCase {
+                std::wstring_view name;
+                bool (*run)(std::string&, std::ostream*);
+            };
+            constexpr CoverageCase deviceShards[] = {
+                {L"device-achievements-score-3029", [](std::string& error, std::ostream* log) {
+                    return RunDeviceAchievementRevisionRegressions(error,0x3029,log);
+                }},
+                {L"device-achievements-score-3013", [](std::string& error, std::ostream* log) {
+                    return RunDeviceAchievementRevisionRegressions(error,0x3013,log);
+                }},
+                {L"device-achievements-score-3103", [](std::string& error, std::ostream* log) {
+                    return RunDeviceAchievementRevisionRegressions(error,0x3103,log);
+                }},
+                {L"preview-parity-factory-13", [](std::string& error, std::ostream* log) {
+                    return RunNativePreviewParity(error, log, 13, 14, int(FirmwareEdition::Factory));
+                }},
+                {L"screen-preview-factory-from-13", [](std::string& error, std::ostream* log) {
+                    return RunNativePreviewParity(error, log, 13, uint32_t(FirmwareLogo::Animation::Count),
+                        int(FirmwareEdition::Factory));
+                }},
+                {L"screen-effects-export", [](std::string& error, std::ostream* log) {
+                    return RunNativeEffectShard(error, log, FirmwareLogo::Animation::None, -1);
+                }},
+                {L"screen-directions-score-from-36", [](std::string& error, std::ostream* log) {
+                    return RunNativePreviewParity(error, log, 36, uint32_t(FirmwareLogo::Animation::Count),
+                        int(FirmwareEdition::Score));
+                }},
+                {L"screen-directions-score", [](std::string& error, std::ostream* log) {
+                    return RunNativeDirectionRegressions(error, log, int(FirmwareEdition::Score));
+                }},
+                {L"screen-directions-factory", [](std::string& error, std::ostream* log) {
+                    return RunNativeDirectionRegressions(error, log, int(FirmwareEdition::Factory));
+                }},
+                {L"screen-preview", RunNativeBasePreviewParity},
+                {L"device-matrix-score-3103", [](std::string& error, std::ostream* log) {
+                    return RunDeviceFunctionalShard(error, log, FirmwareEdition::Score, 0x3103);
+                }},
+                {L"device-matrix-score-3014", [](std::string& error, std::ostream* log) {
+                    return RunDeviceFunctionalShard(error, log, FirmwareEdition::Score, 0x3014);
+                }},
+            };
+            for (const auto& shard : deviceShards) {
+                if (coverageFamily != shard.name) continue;
+                std::string error;
+                if (!shard.run(error, &logF)) {
+                    logF << "NATIVE COVERAGE FAILED: " << error << std::endl;
+                    return 36;
+                }
+                logF << "NATIVE COVERAGE REGRESSIONS OK" << std::endl;
+                return 0;
+            }
+            constexpr CoverageCase cases[] = {
+                {L"screens", RunNativeCoverageRegressions},
+                {L"sx", RunSxPageCoverageRegressions},
+                {L"legacy", RunLegacyCoverageRegressions},
+                {L"three-max", RunThreeMaxCoverageRegressions},
+                {L"layout-landscape-widths", RunLandscapePowerWidthRegressions},
+                {L"pro-plus", RunProPlusCoverageRegressions},
+                {L"device", RunDeviceRegressions},
+                {L"device-revisions", RunDeviceRevisionRegressions},
+                {L"device-matrix", RunDeviceFunctionalMatrix},
+                {L"device-custom-info", RunDeviceCustomInfoRegressions},
+                {L"device-menu", RunDeviceMenuRegressions},
+                {L"device-menu-factory-3014", RunDeviceMenuFactory3014Regressions},
+                {L"device-menu-main-surface", RunDeviceMenuMainSurfaceRegressions},
+                {L"device-puff-editor", RunDevicePuffEditorRegressions},
+                {L"device-puff-editor-factory-3148", RunDevicePuffEditorFactory3148Regressions},
+                {L"device-achievements", RunDeviceAchievementRegressions},
+                {L"device-menu-holds", RunDeviceMenuHoldRegressions},
+                {L"menu-preview-ui", RunMenuPreviewUiRegressions},
+                {L"export-review", [](std::string& error, std::ostream* log) {
+                    if (!RunExportReviewRegressions(error)) return false;
+                    if (log) *log << "EXPORT REVIEW REGRESSIONS OK" << std::endl;
+                    return true;
+                }},
+                {L"export-review-ui", RunExportReviewUiRegressions},
+                {L"async-preview", [](std::string& error, std::ostream* log) {
+                    if (!RunAsyncPreviewRegressions(error)) return false;
+                    if (log) *log << "ASYNC PREVIEW REGRESSIONS OK" << std::endl;
+                    return true;
+                }},
+                {L"device-worker", [](std::string& error, std::ostream* log) {
+                    if (!RunDeviceWorkerRegressions(error)) return false;
+                    if (log) *log << "DEVICE WORKER REGRESSIONS OK" << std::endl;
+                    return true;
+                }},
+                {L"device-input", [](std::string& error, std::ostream* log) {
+                    if (!RunDeviceInputRegressions(error)) return false;
+                    if (log) *log << "DEVICE INPUT REGRESSIONS OK" << std::endl;
+                    return true;
+                }},
+                {L"unicorn-jit", RunUnicornJitRegressions},
+                {L"flash", RunFlashUsageRegressions},
+                {L"editable-sources", RunEditableSourceRegressions},
+                {L"editable-source-ui", RunEditableSourceUiRegressions},
+                {L"patch-playback", RunPatchPlaybackRegressions},
+                {L"screen-effects", RunNativeEffectRegressions},
+                {L"device-diagnostics-ui", RunDeviceDiagnosticsUiRegressions},
+                {L"async-files", [](std::string& error, std::ostream* log) {
+                    return RunAsyncFileRegressions(error, log);
+                }},
+                {L"modal-motion", RunModalMotionRegressions},
+                {L"preferences", RunPreferencesRegressions},
+            };
+            bool matched = false;
+            for (const auto& test : cases) {
+                if (coverageFamily != L"all" && coverageFamily != test.name) continue;
+                matched = true;
+                std::string error;
+                if (!test.run(error, &logF)) {
+                    logF << "NATIVE COVERAGE FAILED: " << error << std::endl;
+                    return 36;
+                }
+            }
+            if (!matched) { logF << "Unknown native coverage family" << std::endl; return 37; }
+            logF << "NATIVE COVERAGE REGRESSIONS OK" << std::endl;
+            return 0;
+        }
+        if (projectTest) {
+            std::string error;
+            if (!RunProjectRegressions(error)) {
+                logF << "PROJECT REGRESSIONS FAILED: " << error << std::endl;
+                return 32;
+            }
+            logF << "PROJECT REGRESSIONS OK" << std::endl;
+            if (!RunPreviewRegressions(error)) {
+                logF << "PREVIEW REGRESSIONS FAILED: " << error << std::endl;
+                return 33;
+            }
+            logF << "PREVIEW REGRESSIONS OK" << std::endl;
+            if (!RunLayoutGeometryRegressions(error)) {
+                logF << "LAYOUT GEOMETRY REGRESSIONS FAILED: " << error << std::endl;
+                return 34;
+            }
+            logF << "LAYOUT GEOMETRY REGRESSIONS OK" << std::endl;
+            if (!RunLayoutSelectionRegressions(error)) {
+                logF << "LAYOUT SELECTION REGRESSIONS FAILED: " << error << std::endl;
+                return 35;
+            }
+            logF << "LAYOUT SELECTION REGRESSIONS OK" << std::endl;
+            return 0;
+        }
+        if (layoutTest) {
+            std::string error;
+            if (!RunLayoutRegressions(error, &logF)) {
+                logF << "LAYOUT REGRESSIONS FAILED: " << error << std::endl;
+                return 31;
+            }
+            return 0;
+        }
         // Enable DPI awareness via ImGui helper
         ImGui_ImplWin32_EnableDpiAwareness();
 
@@ -99,12 +358,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
             0L,
             0L,
             GetModuleHandle(nullptr),
-            LoadIcon(nullptr, IDI_APPLICATION),
+            static_cast<HICON>(LoadImageW(GetModuleHandle(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON,
+                GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED)),
             LoadCursor(nullptr, IDC_ARROW),
             nullptr,
             nullptr,
             L"VoopooAllInOneStudioClass",
-            nullptr
+            static_cast<HICON>(LoadImageW(GetModuleHandle(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED))
         };
         if (!RegisterClassExW(&wc)) {
             logF << "RegisterClassExW failed! Error=" << GetLastError() << "\n" << std::flush;
@@ -124,8 +385,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
         // Create application window
         HWND hwnd = CreateWindowW(
             wc.lpszClassName,
-            L"Voopoo DRAG S - All-in-One Firmware & Resource Studio (Dear ImGui C++)",
-            WS_OVERLAPPEDWINDOW,
+            L"Voopoo Firmware Studio v" STUDIO_VERSION,
+            WS_OVERLAPPEDWINDOW & ~WS_CAPTION,
             posX, posY, winW, winH,
             nullptr, nullptr, wc.hInstance, nullptr
         );
@@ -136,6 +397,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
             return 1;
         }
         logF << "CreateWindowW succeeded. HWND=" << (void*)hwnd << "\n" << std::flush;
+        WindowChrome::Initialize(hwnd);
 
         // Enable drag and drop files from Windows Explorer
         DragAcceptFiles(hwnd, TRUE);
@@ -148,6 +410,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
             return 1;
         }
         logF << "CreateDeviceD3D succeeded.\n" << std::flush;
+        if (!WindowChrome::InitializeGraphics(g_pd3dDevice, g_pd3dDeviceContext))
+            logF << "Could not load the title-bar icon.\n" << std::flush;
 
         // Show the window explicitly and bring to front
         ShowWindow(hwnd, SW_SHOW);
@@ -195,12 +459,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
             io.Fonts->AddFontDefault();
         }
 
+        UiMarkdown::InitializeFonts(i18nRanges);
+
         // Setup Dear ImGui style
         ImGui::StyleColorsDark();
         ImGuiStyle& style = ImGui::GetStyle();
         style.WindowRounding = 0.0f;
         style.FrameRounding = 4.0f;
         style.ItemSpacing = ImVec2(8.0f, 6.0f);
+        style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.65f);
 
         // Setup Platform/Renderer backends
         ImGui_ImplWin32_Init(hwnd);
@@ -211,13 +478,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
         // App State Initialization
         // -------------------------------------------------------------
         logF << "Initializing StudioState...\n" << std::flush;
+        StudioPreferences::Load();
         StudioState studio;
+        studio.previewZoom = StudioPreferences::Get().resourceZoom;
+        UiFirmwareComparison::State comparison;
+        UiFirmwareEmulator::State emulator;
+        UiFirmwareLayout::State layout;
+        UiFirmwarePatches::State patches;
+        UiResourceStudio::BindPatchEditor(&patches);
+        struct UnbindPatchEditor {
+            ~UnbindPatchEditor() { UiResourceStudio::BindPatchEditor(nullptr); }
+        } patchEditorBinding;
+        UiAppUpdate::State updates;
+        UiSettings::State settings;
+        studio.showStartupChooser = !smokeTest;
         logF << "StudioState created.\n" << std::flush;
         studio.statusMsg = Tr(i18n::Str::MsgReadyOpenFw);
 
 
         FirmwarePackage base;
         std::string baseError;
+        if (smokeTest) {
         if (!LoadEmbeddedFirmware(base, baseError) ||
             !studio.LoadPackage(std::move(base), "A050 score version.zwdf", baseError)) {
             char errBuf[256];
@@ -244,6 +525,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                     return 20;
                 }
                 logF << "EDITOR REGRESSIONS OK" << std::endl;
+                if (!RunComparisonRegressions(baseError)) {
+                    logF << "COMPARISON REGRESSIONS FAILED: " << baseError << std::endl;
+                    return 28;
+                }
+                logF << "COMPARISON REGRESSIONS OK" << std::endl;
+                if (!RunAppUpdateRegressions(baseError)) {
+                    logF << "UPDATE METADATA REGRESSIONS FAILED: " << baseError << std::endl;
+                    return 30;
+                }
+                logF << "UPDATE METADATA REGRESSIONS OK" << std::endl;
+                if (!RunEmulatorRegressions(baseError)) {
+                    logF << "EMULATOR REGRESSIONS FAILED: " << baseError << std::endl;
+                    return 29;
+                }
+                logF << "EMULATOR REGRESSIONS OK" << std::endl;
                 if (!RunHistoryRegressions(baseError)) {
                     logF << "HISTORY REGRESSIONS FAILED: " << baseError << std::endl;
                     return 22;
@@ -254,6 +550,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                     return 23;
                 }
                 logF << "SAVE REGRESSIONS OK" << std::endl;
+                if (!RunModelRegressions(baseError)) {
+                    logF << "MODEL REGRESSIONS FAILED: " << baseError << std::endl;
+                    return 24;
+                }
+                logF << "DRAG S / DRAG X MODEL REGRESSIONS OK" << std::endl;
+                if (!RunXwdfRegressions(baseError)) {
+                    logF << "XWDF REGRESSIONS FAILED: " << baseError << std::endl;
+                    return 25;
+                }
+                logF << "DRAG 2 XWDF REGRESSIONS OK" << std::endl;
+                if (!RunFactoryRegressions(baseError)) {
+                    logF << "FACTORY REGRESSIONS FAILED: " << baseError << std::endl;
+                    return 26;
+                }
+                logF << "DRAG S / DRAG X FACTORY REGRESSIONS OK" << std::endl;
+                if (!RunNativeProfileRegressions(baseError)) {
+                    logF << "NATIVE PROFILE REGRESSIONS FAILED: " << baseError << std::endl;
+                    return 27;
+                }
+                logF << "ALL NATIVE PROFILE REGRESSIONS OK" << std::endl;
                 if (!RunFirmwareColorAudit(studio, baseError)) {
                     logF << "FIRMWARE COLOR AUDIT FAILED: " << baseError << std::endl;
                     return 21;
@@ -265,7 +581,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                     studio.assetPaintColors[spec.id] = Rgb8(255, 0, 0);
                     const auto color = studio.GetForegroundForAsset(spec);
                     studio.assetPaintColors.erase(spec.id);
-                    const char* role = PaletteIdForAsset(spec, studio.previewRank, studio.previewCyanMode);
+                    const char* role = PaletteIdForAsset(spec, studio.previewRank, studio.previewCyanMode, studio.edition, studio.model);
                     const auto expected = role ? studio.GetPaletteColor(role) : Rgb8(255, 255, 255);
                     if (color != expected) return 4;
                     ++whiteGlyphs;
@@ -344,17 +660,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
 
             }
         }
+        }
 
         // Font Generator State
         logF << "Initializing FontGenState...\n" << std::flush;
         FontGenState fontState;
         fontState.Init();
-        logF << "Found " << fontState.popularFonts.size() << " fonts.\n" << std::flush;
+        logF << "Found " << fontState.installedFonts.size() << " fonts.\n" << std::flush;
 
         logF << "Entering main loop...\n" << std::flush;
 
         // Main loop
         bool done = false;
+        std::vector<std::string> pendingDroppedFiles;
+        size_t pendingDroppedIndex = 0;
         int debugFrame = 0;
         while (!done) {
             if (debugFrame < 5) {
@@ -369,66 +688,30 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                 }
             }
             if (done) break;
+            UiResourceStudio::PollFileActions(studio, hwnd);
             if (g_CloseRequested) {
                 g_CloseRequested = false;
-                if (UiResourceStudio::ConfirmUnsavedChanges(studio, hwnd)) {
+                if (UiResourceStudio::RequestClose(studio, hwnd)) {
                     done = true;
                     break;
                 }
             }
 
             // Handle Drag & Drop files
-            if (!g_DroppedFiles.empty()) {
-                const auto droppedFiles = std::move(g_DroppedFiles);
-                g_DroppedFiles.clear();
-                for (const auto& dropPath : droppedFiles) {
+            if (UiResourceStudio::IsFileActionActive()) g_DroppedFiles.clear();
+            for (auto& path : g_DroppedFiles) pendingDroppedFiles.push_back(std::move(path));
+            g_DroppedFiles.clear();
+            while (pendingDroppedIndex < pendingDroppedFiles.size() && !UiResourceStudio::IsFileActionActive()) {
+                    const std::string dropPath = std::move(pendingDroppedFiles[pendingDroppedIndex++]);
                     if (fs::is_directory(PathUtils::ToFsPath(dropPath))) {
-                        studio.PushUndo(std::string(Tr(i18n::Str::BtnImportFolder)) + ": " + dropPath);
-                        int imported = 0;
-                        for (const auto& entry : fs::directory_iterator(PathUtils::ToFsPath(dropPath))) {
-                            if (!entry.is_regular_file()) continue;
-                            std::string p = PathUtils::WideToUtf8(entry.path().wstring());
-                            std::string ext = entry.path().extension().string();
-                            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                            if (ext != ".png") continue;
-                            std::string stem = entry.path().stem().string();
-                            if (stem == "boot_voopoo_animated_horizontal_136x22") stem = "boot_voopoo_animated";
-                            int matchedIdx = studio.FindAssetIndex(stem);
-                            if (matchedIdx >= 0) {
-                                const auto& spec = studio.catalog[matchedIdx];
-                                if (spec.format == AssetFormat::Rgb565) {
-                                    std::vector<uint32_t> rgba;
-                                    std::string err;
-                                    if (FirmwareBitmap::LoadAndFitRgb565(p, spec.width, spec.height, rgba, err)) {
-                                        std::vector<uint8_t> newRaw;
-                                        if (FirmwareBitmap::EncodeRgb565(rgba.data(), spec.width, spec.height, newRaw)) {
-                                            if (newRaw != studio.originals[matchedIdx]) imported++;
-                                            studio.SetBitmapReplacement(matchedIdx, std::move(newRaw));
-                                        }
-                                    }
-                                } else {
-                                    std::vector<uint8_t> gray;
-                                    std::string err;
-                                    if (FirmwareBitmap::LoadAndFit(p, spec.width, spec.height, gray, err)) {
-                                        std::vector<uint8_t> newRaw;
-                                        if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[matchedIdx].data(), spec.byte_len(), newRaw)) {
-                                            if (newRaw != studio.originals[matchedIdx]) imported++;
-                                            studio.SetBitmapReplacement(matchedIdx, std::move(newRaw));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgImportedMatchingPngs), imported);
-                        studio.statusMsg = _m;
-                        studio.statusIsErr = false;
+                        UiResourceStudio::ImportFolder(studio, hwnd, dropPath);
                         continue;
                     }
 
                     std::string ext = fs::path(PathUtils::ToFsPath(dropPath)).extension().string();
                     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
-                    if (ext == ".zwdf" || ext == ".swdf") {
+                    if (ext == ".zwdf" || ext == ".swdf" || ext == ".xwdf" || ext == ".vfwp") {
                         UiResourceStudio::OpenFirmware(studio, hwnd, dropPath);
                     }
                     else if (ext == ".ttf" || ext == ".otf") {
@@ -451,61 +734,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                         if (matchedIdx < 0 && studio.selectedVisibleIdx >= 0 && studio.selectedVisibleIdx < (int)studio.visibleAssetIndices.size()) {
                             matchedIdx = (int)studio.visibleAssetIndices[studio.selectedVisibleIdx];
                         }
-                        if (matchedIdx >= 0) {
-                            const auto& spec = studio.catalog[matchedIdx];
-                            studio.PushUndo("Drop PNG " + spec.id);
-                            if (spec.format == AssetFormat::Rgb565) {
-                                std::vector<uint32_t> rgba;
-                                std::string err;
-                                if (FirmwareBitmap::LoadAndFitRgb565(dropPath, spec.width, spec.height, rgba, err)) {
-                                    std::vector<uint8_t> newRaw;
-                                    if (FirmwareBitmap::EncodeRgb565(rgba.data(), spec.width, spec.height, newRaw)) {
-                                        if (newRaw == studio.originals[matchedIdx]) {
-                                            char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgPngMatchesOriginal), spec.id.c_str());
-                                            studio.statusMsg = _m;
-                                        } else {
-                                            char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgStagedReplacement), spec.id.c_str());
-                                            studio.statusMsg = _m;
-                                        }
-                                        studio.SetBitmapReplacement(matchedIdx, std::move(newRaw));
-                                        studio.statusIsErr = false;
-                                    }
-                                } else {
-                                    char _m[512]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgPngLoadError), err.c_str());
-                                    studio.statusMsg = _m;
-                                    studio.statusIsErr = true;
-                                }
-                            } else {
-                                std::vector<uint8_t> gray;
-                                std::string err;
-                                if (FirmwareBitmap::LoadAndFit(dropPath, spec.width, spec.height, gray, err)) {
-                                    std::vector<uint8_t> newRaw;
-                                    if (FirmwareBitmap::EncodeMaskPreserving(gray.data(), spec.width, spec.height, studio.originals[matchedIdx].data(), spec.byte_len(), newRaw)) {
-                                        if (newRaw == studio.originals[matchedIdx]) {
-                                            char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgPngMatchesOriginal), spec.id.c_str());
-                                            studio.statusMsg = _m;
-                                        } else {
-                                            char _m[256]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgStagedReplacement), spec.id.c_str());
-                                            studio.statusMsg = _m;
-                                        }
-                                        studio.SetBitmapReplacement(matchedIdx, std::move(newRaw));
-                                        studio.statusIsErr = false;
-                                    }
-                                } else {
-                                    char _m[512]; snprintf(_m, sizeof(_m), Tr(i18n::Str::MsgPngLoadError), err.c_str());
-                                    studio.statusMsg = _m;
-                                    studio.statusIsErr = true;
-                                }
-                            }
-                        }
+                        if (matchedIdx >= 0)
+                            UiResourceStudio::ImportImage(studio, hwnd, dropPath, matchedIdx);
                     }
-                }
+            }
+            if (pendingDroppedIndex == pendingDroppedFiles.size()) {
+                pendingDroppedFiles.clear();
+                pendingDroppedIndex = 0;
             }
 
             // Define frame rendering lambda
             auto RenderFrame = [&]() {
                 static bool s_inRender = false;
-                if (s_inRender || UiResourceStudio::IsFileActionActive()) return;
+                if (s_inRender) return;
                 s_inRender = true;
 
                 // Handle window resize
@@ -525,36 +766,47 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
 
                 // Fill full viewport
                 ImGuiIO& curIo = ImGui::GetIO();
-                ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
-                ImGui::SetNextWindowSize(curIo.DisplaySize);
+                WindowChrome::Render(hwnd);
+                const float captionHeight = WindowChrome::Height();
+                ImGui::SetNextWindowPos(ImVec2(0.0f, captionHeight));
+                ImGui::SetNextWindowSize(ImVec2(curIo.DisplaySize.x, curIo.DisplaySize.y - captionHeight));
             ImGuiWindowFlags mainFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                                          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                                          ImGuiWindowFlags_NoBringToFrontOnFocus |
-                                         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+                                         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                                         ImGuiWindowFlags_MenuBar;
 
             ImGui::Begin("MainWindow", nullptr, mainFlags);
             {
-                // Top App Bar: Title and Status
-                ImGui::TextColored(ImVec4(0.3f, 0.85f, 1.0f, 1.0f), "%s", Tr(i18n::Str::AppTitle));
-                ImGui::SameLine();
-
+                ImGui::BeginDisabled(UiResourceStudio::IsFileActionActive());
+                UiResourceStudio::RenderMenuBar(studio, hwnd);
+                UiAppUpdate::RenderMenuBar(updates);
+                UiSettings::RenderMenuBar(settings);
+                if (studio.hasFirmware) {
+                    ImGui::Text("%s %s", FirmwareModelName(studio.model), FirmwareEditionName(studio.edition));
+                    ImGui::SameLine();
+                }
                 if (studio.hasFirmware) {
                     std::string shortHash = studio.firmware.source_sha256.substr(0, 10);
                     std::transform(shortHash.begin(), shortHash.end(), shortHash.begin(), ::toupper);
-                    std::string fwName = PathUtils::WideToUtf8(PathUtils::ToFsPath(studio.firmwarePath).filename().wstring());
-                    if (studio.isBuiltin) {
+                    std::string fwName = PathUtils::WideToUtf8(PathUtils::ToFsPath(
+                        studio.projectPath.empty() ? studio.firmwarePath : studio.projectPath).filename().wstring());
+                    if (studio.isBuiltin && studio.projectPath.empty()) {
                         fwName += " (";
                         fwName += Tr(i18n::Str::LabelBuiltin);
                         fwName += ")";
                     }
                     char fBuf[256];
-                    snprintf(fBuf, sizeof(fBuf), Tr(i18n::Str::BadgeFirmwareSummary),
+                    snprintf(fBuf, sizeof(fBuf), Tr(studio.projectPath.empty() ?
+                        i18n::Str::BadgeFirmwareSummary : i18n::Str::BadgeProjectSummary),
                         fwName.c_str(),
                         shortHash.c_str(),
                         studio.firmware.records.size(),
-                        studio.replacements.size());
+                        studio.replacements.size() + studio.layoutOffsets.size() +
+                        size_t(studio.screenPatches != studio.originalScreenPatches) +
+                        size_t(studio.menuPatch != studio.originalMenuPatch));
                     ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.5f, 1.0f), "%s", fBuf);
-                    if (studio.HasUnsavedChanges()) {
+                    if (UiResourceStudio::HasUnsavedChanges(studio)) {
                         ImGui::SameLine();
                         ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", Tr(i18n::Str::LabelModified));
                     }
@@ -566,7 +818,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                 ImGui::Separator();
 
                 // Reserve footer height for pinned bottom status bar
-                float footerHeight = ImGui::GetFrameHeightWithSpacing() + 6.0f;
+                float footerHeight = ImGui::GetTextLineHeightWithSpacing() + 6.0f;
                 float workspaceHeight = ImGui::GetContentRegionAvail().y - footerHeight;
                 if (workspaceHeight < 150.0f) workspaceHeight = 150.0f;
 
@@ -574,14 +826,29 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                 {
 
                     // Main Tab Bar
-                    if (ImGui::BeginTabBar("MainTabBar", ImGuiTabBarFlags_None)) {
+                    if (Ui::BeginTabBar("MainTabBar", ImGuiTabBarFlags_None)) {
                         // TAB 1: Resource Studio
                         UiResourceStudio::RenderTab(studio, hwnd, g_pd3dDevice, g_pd3dDeviceContext);
 
                         // TAB 2: Font Generator
                         UiFontGenerator::RenderTab(studio, fontState, hwnd, smokeTest, debugFrame);
 
-                        // TAB 3: Firmware Info
+                        UiFirmwareEmulator::RenderTab(emulator, studio, g_pd3dDevice, g_pd3dDeviceContext);
+                        layout.activeTab = false;
+                        patches.activeTab = false;
+                        if (Ui::BeginTabItem(Tr(i18n::Str::TabFirmwarePatches))) {
+                            if (Ui::BeginTabBar("PatchSections")) {
+                                UiFirmwarePatches::RenderTab(patches, studio, g_pd3dDevice, g_pd3dDeviceContext);
+                                UiFirmwareLayout::RenderTab(layout, studio, g_pd3dDevice, g_pd3dDeviceContext, patches);
+                                UiFirmwareMenu::RenderTab(patches, studio, g_pd3dDevice, g_pd3dDeviceContext);
+                                ImGui::EndTabBar();
+                            }
+                            ImGui::EndTabItem();
+                        } else {
+                            UiFirmwareLayout::Deactivate(layout, studio);
+                        }
+                        if (!patches.activeTab) patches.playback.Pause();
+                        UiFirmwareComparison::RenderTab(comparison, studio, hwnd, g_pd3dDevice);
                         UiFirmwareInfo::RenderTab(studio);
 
 
@@ -589,30 +856,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                     }
                 }
                 ImGui::EndChild();
+                ImGui::EndDisabled();
+                UiStartup::Render(studio, hwnd, g_pd3dDevice, g_pd3dDeviceContext);
+                if (!UiResourceStudio::IsFileActionActive())
+                    UiAppUpdate::RenderDialog(updates, studio, hwnd);
+                if (!UiResourceStudio::IsFileActionActive())
+                    UiSettings::RenderDialog(settings, studio);
 
                 // Bottom Status Bar (ALWAYS PINNED TO BOTTOM!)
                 ImGui::Separator();
+                const float versionWidth = ImGui::CalcTextSize("v" STUDIO_VERSION).x;
+                const float versionX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - versionWidth;
+                const ImVec2 statusPos = ImGui::GetCursorScreenPos();
+                ImGui::PushClipRect(statusPos,
+                    ImVec2(statusPos.x + ImGui::GetContentRegionAvail().x - versionWidth -
+                        ImGui::GetStyle().ItemSpacing.x, statusPos.y + ImGui::GetTextLineHeight()), true);
                 ImVec4 statusCol = studio.statusIsErr ? ImVec4(1.0f, 0.35f, 0.35f, 1.0f) : ImVec4(0.4f, 0.9f, 1.0f, 1.0f);
                 ImGui::TextColored(statusCol, "%s", studio.statusMsg.c_str());
+                ImGui::PopClipRect();
+                ImGui::SameLine(versionX);
+                ImGui::TextDisabled("v" STUDIO_VERSION);
 
-                // Language Selector Dropdown (Bottom Right)
-                {
-                    const auto& langs = i18n::GetSupportedLanguages();
-                    const auto& curLang = i18n::GetCurrentLanguageInfo();
-                    ImGui::SameLine(ImGui::GetWindowWidth() - 170.0f);
-                    ImGui::SetNextItemWidth(150.0f);
-                    if (ImGui::BeginCombo("##LangSelect", curLang.displayName, ImGuiComboFlags_NoArrowButton)) {
-                        for (const auto& li : langs) {
-                            bool selected = (li.lang == i18n::GetCurrentLanguage());
-                            if (ImGui::Selectable(li.displayName, selected)) {
-                                i18n::SetLanguage(li.lang);
-                                i18n::SaveSettings();
-                            }
-                            if (selected) ImGui::SetItemDefaultFocus();
-                        }
-                        ImGui::EndCombo();
-                    }
-                }
 
                 // Build Success Modal Dialog
                 if (studio.showBuildModal) {
@@ -628,6 +892,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                     ImGui::Text(Tr(i18n::Str::ModalSha256), studio.lastReport.output_sha256.c_str());
                     ImGui::Text(Tr(i18n::Str::ModalModBitmaps), studio.lastReport.changed_assets);
                     ImGui::Text(Tr(i18n::Str::ModalModColorGroups), studio.lastReport.changed_colors);
+                    ImGui::Text("%s: %zu", Tr(i18n::Str::LayoutChangedElements), studio.lastReport.changed_layout_elements);
                     ImGui::Text(Tr(i18n::Str::ModalPatchedRanges), studio.lastReport.patched_ranges, studio.lastReport.records);
                     ImGui::Text(Tr(i18n::Str::ModalUntouchedBytes), studio.lastReport.unchanged_payload_bytes_verified);
                     ImGui::Separator();
@@ -644,18 +909,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                     }
                     ImGui::EndPopup();
                 }
+                UiResourceStudio::RenderFileProgress(studio);
             }
             ImGui::End();
 
             // Global Keyboard Shortcuts
-            if (!ImGui::GetIO().WantTextInput && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+            if (!UiResourceStudio::IsFileActionActive() && Ui::DocumentKeyboardAvailable()) {
                 ImGuiIO& curIo = ImGui::GetIO();
                 bool ctrl = curIo.KeyCtrl;
                 bool shift = curIo.KeyShift;
 
                 // Ctrl + Z: Undo
                 if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_Z)) {
-                    if (studio.CanUndo()) {
+                    if (patches.activeTab && UiFirmwareRisk::Accepted() && UiFirmwarePatches::UndoDraft(patches)) {
+                        // Draft edits take precedence over applied document history.
+                    } else if (studio.CanUndo()) {
                         std::string desc = studio.undoStack.back().desc;
                         studio.Undo();
                         char buf[256];
@@ -675,24 +943,32 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                         studio.statusIsErr = false;
                     }
                 }
+                // Copy the complete patch; paste opens the transfer chooser.
+                else if (patches.activeTab && UiFirmwareRisk::Accepted() && ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_C)) {
+                    UiFirmwarePatches::CopyToClipboard(patches, hwnd);
+                }
+                else if (patches.activeTab && UiFirmwareRisk::Accepted() && ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_V)) {
+                    patches.requestPaste = true;
+                }
                 // Ctrl + C: Copy selected asset to clipboard
-                else if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_C)) {
+                else if (UiResourceStudio::IsActive() && ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_C)) {
                     CopyCurrentSelectedAsset(studio, hwnd);
                 }
                 // Ctrl + V: Paste from clipboard into selected asset
-                else if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_V)) {
+                else if (UiResourceStudio::IsActive() && ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_V)) {
                     PasteIntoCurrentSelectedAsset(studio, hwnd);
                 }
                 // Ctrl + O: Open firmware
                 else if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_O)) {
                     UiResourceStudio::OpenFirmware(studio, hwnd);
                 }
-                // Ctrl + S: Build firmware
-                else if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_S)) {
-                    UiResourceStudio::SaveFirmware(studio, hwnd);
+                // Ctrl+S saves the project; Ctrl+Shift+S chooses a new path.
+                else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
+                    UiResourceStudio::SaveProject(studio, hwnd, shift);
                 }
                 // Up / Down arrow navigation across visible assets
-                else if (!ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+                else if (UiResourceStudio::IsActive() && !ctrl && !shift &&
+                    ImGui::IsKeyPressed(ImGuiKey_UpArrow, ImGuiInputFlags_Repeat, ImGuiKeyOwner_NoOwner)) {
                     if (!studio.visibleAssetIndices.empty() && studio.selectedVisibleIdx > 0) {
                         studio.selectedVisibleIdx--;
                         size_t catIdx = studio.visibleAssetIndices[studio.selectedVisibleIdx];
@@ -701,7 +977,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
                         strncpy_s(studio.assetHexEditBuf, c.ToHex().c_str(), sizeof(studio.assetHexEditBuf));
                     }
                 }
-                else if (!ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+                else if (UiResourceStudio::IsActive() && !ctrl && !shift &&
+                    ImGui::IsKeyPressed(ImGuiKey_DownArrow, ImGuiInputFlags_Repeat, ImGuiKeyOwner_NoOwner)) {
                     if (!studio.visibleAssetIndices.empty() && studio.selectedVisibleIdx + 1 < (int)studio.visibleAssetIndices.size()) {
                         studio.selectedVisibleIdx++;
                         size_t catIdx = studio.visibleAssetIndices[studio.selectedVisibleIdx];
@@ -715,7 +992,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
             // Direct3D 11 Rendering
             ImGui::Render();
             if (g_mainRenderTargetView) {
-                const float clear_color[4] = { 0.10f, 0.10f, 0.12f, 1.00f };
+                const ImVec4 background = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
+                const float clear_color[4] = { background.x, background.y, background.z, 1.0f };
                 g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
                 g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color);
                 ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
@@ -738,6 +1016,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
     g_RenderCallback = nullptr;
 
         // Cleanup
+        UiStartup::Release();
         ImGui_ImplDX11_Shutdown();
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
@@ -751,12 +1030,29 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR commandLine, int) {
     }
     catch (const std::exception& e) {
         logF << "FATAL EXCEPTION: " << e.what() << "\n" << std::flush;
-        MessageBoxA(nullptr, e.what(), "Voopoo DRAG S Studio - Fatal Error", MB_ICONERROR);
+        if (dynamic_cast<const std::bad_alloc*>(&e)) {
+            PROCESS_MEMORY_COUNTERS_EX process{};
+            MEMORYSTATUSEX memory{sizeof(MEMORYSTATUSEX)};
+            const bool measured = GetProcessMemoryInfo(GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&process), sizeof(process)) && GlobalMemoryStatusEx(&memory);
+            logF << "ALLOCATION MEMORY measured=" << measured << " private=" << process.PrivateUsage
+                << " peak=" << process.PeakPagefileUsage << " availableCommit=" << memory.ullAvailPageFile
+                << " availableVirtual=" << memory.ullAvailVirtual << '\n' << std::flush;
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+            const bool jobMeasured = QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation,
+                &limits, sizeof(limits), nullptr);
+            logF << "ALLOCATION JOB measured=" << jobMeasured << " flags=" << limits.BasicLimitInformation.LimitFlags
+                << " processMemoryLimit=" << limits.ProcessMemoryLimit << " jobMemoryLimit=" << limits.JobMemoryLimit
+                << '\n' << std::flush;
+        }
+        if (!coverageTest)
+            MessageBoxA(nullptr, e.what(), "Voopoo Firmware Studio - Fatal Error", MB_ICONERROR);
         return 1;
     }
     catch (...) {
         logF << "FATAL UNKNOWN EXCEPTION\n" << std::flush;
-        MessageBoxA(nullptr, "An unexpected crash occurred.", "Voopoo DRAG S Studio - Error", MB_ICONERROR);
+        if (!coverageTest)
+            MessageBoxA(nullptr, "An unexpected crash occurred.", "Voopoo Firmware Studio - Error", MB_ICONERROR);
         return 1;
     }
 }
@@ -795,6 +1091,7 @@ bool CreateDeviceD3D(HWND hWnd) {
 }
 
 void CleanupDeviceD3D() {
+    WindowChrome::ReleaseGraphics();
     CleanupRenderTarget();
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
     if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
@@ -823,6 +1120,9 @@ void CleanupRenderTarget() {
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    LRESULT chromeResult = 0;
+    if (WindowChrome::HandleMessage(hWnd, msg, wParam, lParam, chromeResult))
+        return chromeResult;
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
         return true;
 
@@ -862,6 +1162,16 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_InSizeMove = false;
         KillTimer(hWnd, 1);
         return 0;
+    case WM_GETMINMAXINFO: {
+        auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+        const UINT dpi = (std::max)(96u, GetDpiForWindow(hWnd));
+        RECT minimum{0, 0, MulDiv(1000, dpi, 96), MulDiv(700, dpi, 96) + static_cast<LONG>(WindowChrome::Height())};
+        const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hWnd, GWL_STYLE));
+        AdjustWindowRectExForDpi(&minimum, style, FALSE, 0, dpi);
+        limits->ptMinTrackSize.x = minimum.right - minimum.left;
+        limits->ptMinTrackSize.y = minimum.bottom - minimum.top;
+        return 0;
+    }
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED)
             return 0;
@@ -881,7 +1191,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
     case WM_SYSCOMMAND:
-        if ((wParam & 0xfff0) == SC_KEYMENU)
+        if ((wParam & 0xfff0) == SC_KEYMENU && lParam != L' ')
             return 0;
         break;
     case WM_DESTROY:

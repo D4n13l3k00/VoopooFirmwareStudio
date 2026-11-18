@@ -1,4 +1,5 @@
 #include "presets.h"
+#include "../core/firmware_extensions.h"
 #include <cstdio>
 
 Preset Preset::font_19x40() {
@@ -58,6 +59,28 @@ Preset Preset::font_6x10() {
     return p;
 }
 
-std::vector<Preset> Preset::all() {
+std::vector<Preset> Preset::all(FirmwareModel model, FirmwareEdition edition) {
+    if (const auto* extension = FirmwareExtensionFor(model)) return extension->presets(model, edition);
+    if (model == FirmwareModel::Drag2) {
+        std::vector<Preset> presets;
+        auto add = [&](const char* prefix, const char* name, int width, int height, const char* chars) {
+            Preset preset;
+            preset.name = name;
+            preset.description = name;
+            preset.width = width;
+            preset.height = height;
+            for (size_t i = 0; chars[i]; ++i) {
+                char filename[64];
+                snprintf(filename, sizeof(filename), "%s_%02zu.png", prefix, i);
+                preset.glyphs.push_back({chars[i], filename});
+            }
+            presets.push_back(std::move(preset));
+        };
+        add("font_10x30", "10x30", 10, 30, "0123456789");
+        add("font_10x12", "10x12", 10, 12, "0123456789");
+        add("font_5x8", "5x8", 5, 8, "0123456789");
+        add("font_hex_5x8", "5x8 HEX", 5, 8, "0123456789ABCDEF");
+        return presets;
+    }
     return { font_19x40(), font_11x20(), font_7x13(), font_6x10() };
 }

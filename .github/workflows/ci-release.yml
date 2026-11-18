@@ -45,8 +45,42 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build Release (x64)
+        shell: pwsh
         run: |
-          msbuild VoopooFirmwareStudio.sln /p:Configuration=Release /p:Platform=x64 /m /v:m
+          $versionArgs = @()
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            if ($env:GITHUB_REF_NAME -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+              throw "Release tag must be vMAJOR.MINOR.PATCH"
+            }
+            $versionArgs = @("/p:StudioVersion=$($env:GITHUB_REF_NAME.Substring(1))")
+          }
+          & msbuild VoopooFirmwareStudio.sln /p:Configuration=Release /p:Platform=x64 /m /v:m @versionArgs
+          if ($LASTEXITCODE -ne 0) { throw "Release build failed" }
+
+      - name: Verify Firmware Projects and Editing Tools
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath .\build\Release\VoopooFirmwareStudio.exe -ArgumentList '--project-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Project and editing tests failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Verify Native UI Layouts
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath .\build\Release\VoopooFirmwareStudio.exe -ArgumentList '--layout-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Native layout tests failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Verify All Native Screens and Revisions
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath .\build\Release\VoopooFirmwareStudio.exe -ArgumentList '--coverage-test=all' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            Get-Content studio_debug.log
+            throw "Native coverage tests failed with exit code $($process.ExitCode)"
+          }
 
       - name: Run Smoke Tests
         shell: pwsh
@@ -61,12 +95,30 @@ jobs:
         run: |
           $ver = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME } else { $env:GITHUB_SHA.Substring(0, 8) }
           Copy-Item build/Release/VoopooFirmwareStudio.exe ./VoopooFirmwareStudio-$ver-Release.exe -Force
+          New-Item -ItemType Directory -Force build/corresponding-source | Out-Null
+          git archive --format=zip --output=build/corresponding-source/studio-source.zip HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Cannot package studio sources" }
+          tar -czf build/corresponding-source/unicorn-2.1.4-source.tar.gz -C build/deps unicorn-2.1.4
+          if ($LASTEXITCODE -ne 0) { throw "Cannot package Unicorn sources" }
+          tar -czf build/corresponding-source/xz-5.8.1-source.tar.gz -C build/deps xz-5.8.1
+          if ($LASTEXITCODE -ne 0) { throw "Cannot package XZ sources" }
+          Copy-Item LICENSE build/corresponding-source/MIT-LICENSE
+          Copy-Item third_party/UNICORN-COPYING build/corresponding-source/UNICORN-COPYING
+          Copy-Item third_party/xz.LICENSE build/corresponding-source/xz.LICENSE
+          Compress-Archive -Path build/corresponding-source/* -DestinationPath "./VoopooFirmwareStudio-$ver-Source.zip" -Force
+          Copy-Item third_party/UNICORN-COPYING ./UNICORN-COPYING -Force
+          Copy-Item third_party/*.LICENSE ./ -Force
+          Copy-Item third_party/markdown/*.LICENSE ./ -Force
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: VoopooFirmwareStudio-windows-x64
-          path: VoopooFirmwareStudio-*.exe
+          path: |
+            VoopooFirmwareStudio-*.exe
+            VoopooFirmwareStudio-*-Source.zip
+            UNICORN-COPYING
+            *.LICENSE
           if-no-files-found: error
 
   release:
@@ -105,7 +157,11 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           name: Voopoo Firmware Studio ${{ github.ref_name }}
-          files: VoopooFirmwareStudio-*.exe
+          files: |
+            VoopooFirmwareStudio-*.exe
+            VoopooFirmwareStudio-*-Source.zip
+            UNICORN-COPYING
+            *.LICENSE
           body_path: ${{ runner.temp }}/release-notes.md
           fail_on_unmatched_files: true
           draft: false

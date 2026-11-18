@@ -1,10 +1,20 @@
 #include "zwdf_package.h"
 #include "path_utils.h"
+#include "firmware_catalog.h"
+#include "firmware_color_profiles.h"
+#include "factory_color_profiles.h"
+#include "xwdf_codec.h"
+#include "drag2_color.h"
+#include "firmware_extensions.h"
+#include "firmware_layout.h"
+#include <array>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <cstring>
 #include <algorithm>
+#include <set>
+#include <string_view>
 
 // --- Lightweight portable SHA-256 implementation ---
 namespace {
@@ -138,6 +148,7 @@ std::string BuildReport::ToJson() const {
     ss << "  \"records\": " << records << ",\n";
     ss << "  \"changed_assets\": " << changed_assets << ",\n";
     ss << "  \"changed_colors\": " << changed_colors << ",\n";
+    ss << "  \"changed_layout_elements\": " << changed_layout_elements << ",\n";
     ss << "  \"patched_ranges\": " << patched_ranges << ",\n";
     ss << "  \"unchanged_payload_bytes_verified\": " << unchanged_payload_bytes_verified << ",\n";
     ss << "  \"hardware_codes\": [";
@@ -149,7 +160,9 @@ std::string BuildReport::ToJson() const {
     return ss.str();
 }
 
-bool FirmwarePackage::Open(const std::string& path, FirmwarePackage& out_pkg, std::string& out_err) {
+bool FirmwarePackage::Open(const std::string& path, FirmwarePackage& out_pkg, std::string& out_err,
+                           const std::function<void(const char*)>& progress) {
+    if (progress) progress("Read firmware file");
     auto f = PathUtils::OpenReadStream(path, std::ios::binary);
     if (!f.is_open()) {
         out_err = "Cannot open file: " + path;
@@ -163,10 +176,11 @@ bool FirmwarePackage::Open(const std::string& path, FirmwarePackage& out_pkg, st
     if (sz > 0) {
         f.read((char*)bytes.data(), sz);
     }
-    return Parse(bytes, out_pkg, out_err);
+    return Parse(bytes, out_pkg, out_err, progress);
 }
 
-bool FirmwarePackage::Parse(const std::vector<uint8_t>& bytes, FirmwarePackage& out_pkg, std::string& out_err) {
+bool FirmwarePackage::Parse(const std::vector<uint8_t>& bytes, FirmwarePackage& out_pkg, std::string& out_err,
+                            const std::function<void(const char*)>& progress) {
     if (bytes.empty()) {
         out_err = "Empty firmware file";
         return false;
@@ -174,7 +188,33 @@ bool FirmwarePackage::Parse(const std::vector<uint8_t>& bytes, FirmwarePackage& 
 
     FirmwarePackage pkg;
     pkg.source_bytes = bytes;
+    if (progress) progress("Calculate firmware SHA-256");
     pkg.source_sha256 = ComputeSha256(bytes.data(), bytes.size());
+    if (progress) progress("Parse firmware container and validate record checksums");
+    if (bytes.size() >= 4 && std::memcmp(bytes.data(), "XWDF", 4) == 0) {
+        if (!XwdfCodec::Parse(bytes, pkg, out_err)) return false;
+        out_pkg = std::move(pkg);
+        return true;
+    }
+    if (bytes.size() >= 10 && ReadLeU32(bytes.data()) >= 0x20000000 &&
+        ReadLeU32(bytes.data()) < 0x20010000) {
+        HardwareRecord rec;
+        rec.sp = ReadLeU32(bytes.data());
+        rec.reset = ReadLeU32(bytes.data() + 4);
+        if (!(rec.reset & 1) || rec.reset < 0x08002c00 || rec.reset >= 0x08020000) {
+            out_err = "Invalid SWDF reset vector";
+            return false;
+        }
+        rec.linked_base = rec.reset >= 0x08005800 ? 0x08005800 :
+            rec.reset >= 0x08003000 ? 0x08003000 : 0x08002c00;
+        rec.image.assign(bytes.begin(), bytes.end() - 2);
+        rec.device_code[0] = bytes[bytes.size() - 2];
+        rec.device_code[1] = bytes.back();
+        pkg.format = FirmwareFormat::Swdf;
+        pkg.records.push_back(std::move(rec));
+        out_pkg = std::move(pkg);
+        return true;
+    }
 
     size_t cursor = 0;
     size_t record_index = 0;
@@ -208,23 +248,35 @@ bool FirmwarePackage::Parse(const std::vector<uint8_t>& bytes, FirmwarePackage& 
         uint32_t declared_sum = ReadBeU32(&bytes[cursor]);
         cursor += 4;
 
-        if (cursor + 4 > bytes.size()) {
-            out_err = "Truncated marker length at record " + std::to_string(record_index);
-            return false;
-        }
-        uint32_t marker_len = ReadBeU32(&bytes[cursor]);
-        cursor += 4;
-        if (cursor + marker_len > bytes.size()) {
-            out_err = "Truncated marker bytes at record " + std::to_string(record_index);
-            return false;
-        }
-        const uint8_t* marker_ptr = &bytes[cursor];
-        cursor += marker_len;
-
-        // Verify marker
-        if (marker_len != 10 || std::memcmp(marker_ptr, expected_marker, 10) != 0) {
-            out_err = "Unexpected record marker at record " + std::to_string(record_index);
-            return false;
+        const uint8_t* marker_ptr = bytes.data() + cursor;
+        size_t marker_len = 0;
+        static constexpr uint8_t startEnd[] = {
+            0, 0, 0, 10, 0, 's', 0, 't', 0, 'a', 0, 'r', 0, 't',
+            0, 0, 0, 6, 0, 'e', 0, 'n', 0, 'd'
+        };
+        if (record_index == 0 && bytes.size() - cursor >= sizeof(startEnd) &&
+            std::memcmp(bytes.data() + cursor, startEnd, sizeof(startEnd)) == 0) {
+            pkg.format = FirmwareFormat::ZwdfStartEnd;
+            cursor += sizeof(startEnd);
+        } else if (pkg.format == FirmwareFormat::ZwdfStartEnd) {
+            if (record_index != 1 || cursor != bytes.size()) {
+                out_err = "Invalid start/end ZWDF record boundary";
+                return false;
+            }
+        } else {
+            if (bytes.size() - cursor < 4) {
+                out_err = "Truncated marker length";
+                return false;
+            }
+            marker_len = ReadBeU32(bytes.data() + cursor);
+            cursor += 4;
+            if (marker_len != sizeof(expected_marker) || bytes.size() - cursor < marker_len ||
+                std::memcmp(bytes.data() + cursor, expected_marker, marker_len) != 0) {
+                out_err = "Unexpected record marker at record " + std::to_string(record_index);
+                return false;
+            }
+            marker_ptr = bytes.data() + cursor;
+            cursor += marker_len;
         }
 
         // Verify CRC16 (limited to payload_len & 0xFFFF)
@@ -276,6 +328,10 @@ bool FirmwarePackage::Parse(const std::vector<uint8_t>& bytes, FirmwarePackage& 
         pkg.records.push_back(rec);
         record_index++;
     }
+    if (pkg.format == FirmwareFormat::ZwdfStartEnd && pkg.records.size() != 2) {
+        out_err = "Start/end ZWDF requires two records";
+        return false;
+    }
 
     if (pkg.records.empty()) {
         out_err = "No records found in ZWDF package";
@@ -291,8 +347,8 @@ const uint8_t* FirmwarePackage::BytesAt(size_t record_idx, uint32_t address, siz
     const auto& rec = records[record_idx];
     if (address < rec.linked_base) return nullptr;
     size_t offset = (size_t)(address - rec.linked_base);
-    if (offset + len > rec.image.size()) return nullptr;
-    return &rec.image[offset];
+    if (offset > rec.image.size() || len > rec.image.size() - offset) return nullptr;
+    return rec.image.data() + offset;
 }
 
 bool FirmwarePackage::FindUnique(size_t record_idx, const uint8_t* needle, size_t needle_len, size_t& out_offset) const {
@@ -338,11 +394,30 @@ bool FirmwarePackage::PackWith(
     const std::vector<CodePatch>& code_patches,
     std::vector<uint8_t>& out_bytes,
     BuildReport& out_report,
-    std::string& out_err
+    std::string& out_err,
+    const std::function<void(const char*)>& progress
 ) const {
+    if (progress) progress("Apply resource, palette and code patches");
     std::vector<HardwareRecord> mod_records = records;
     std::vector<std::vector<std::pair<size_t, size_t>>> touched(mod_records.size());
     size_t patched_ranges = 0;
+    for (const auto& patch : code_patches) {
+        if (patch.original.size() != patch.replacement.size()) {
+            out_err = patch.id + ": code patches must preserve instruction length";
+            return false;
+        }
+    }
+    for (const auto& replacement : replacements) {
+        const auto& locations = replacement.second.first;
+        if (locations.size() != records.size()) {
+            out_err = replacement.first + ": resource location map must cover every hardware record";
+            return false;
+        }
+        if (std::all_of(locations.begin(), locations.end(), [](size_t offset) { return offset == SIZE_MAX; })) {
+            out_err = replacement.first + ": resource is absent from every hardware record";
+            return false;
+        }
+    }
 
     for (size_t r_idx = 0; r_idx < mod_records.size(); ++r_idx) {
         auto& rec = mod_records[r_idx];
@@ -353,16 +428,14 @@ bool FirmwarePackage::PackWith(
             const auto& locs = kv.second.first;
             const auto& rep_bytes = kv.second.second;
 
-            if (r_idx >= locs.size()) {
-                out_err = id + ": missing offset location for record " + std::to_string(r_idx);
-                return false;
-            }
             size_t offset = locs[r_idx];
-            if (offset + rep_bytes.size() > rec.image.size()) {
+            if (offset == SIZE_MAX) continue; // Resource is absent from this hardware layout.
+            if (offset > rec.image.size() || rep_bytes.size() > rec.image.size() - offset) {
                 out_err = id + ": replacement is out of bounds in record " + std::to_string(r_idx);
                 return false;
             }
-            std::memcpy(&rec.image[offset], rep_bytes.data(), rep_bytes.size());
+            if (!rep_bytes.empty())
+                std::memcpy(rec.image.data() + offset, rep_bytes.data(), rep_bytes.size());
             touched[r_idx].push_back({ offset, offset + rep_bytes.size() });
             patched_ranges++;
         }
@@ -374,15 +447,17 @@ bool FirmwarePackage::PackWith(
                 return false;
             }
             for (size_t offset : patch.locations[r_idx]) {
-                if (offset + patch.original.size() > rec.image.size()) {
+                if (offset > rec.image.size() || patch.original.size() > rec.image.size() - offset) {
                     out_err = patch.id + ": patch is outside firmware image in record " + std::to_string(r_idx);
                     return false;
                 }
-                if (std::memcmp(&rec.image[offset], patch.original.data(), patch.original.size()) != 0) {
+                if (!patch.original.empty() &&
+                    std::memcmp(rec.image.data() + offset, patch.original.data(), patch.original.size()) != 0) {
                     out_err = patch.id + ": source instruction mismatch in record " + std::to_string(r_idx);
                     return false;
                 }
-                std::memcpy(&rec.image[offset], patch.replacement.data(), patch.replacement.size());
+                if (!patch.replacement.empty())
+                    std::memcpy(rec.image.data() + offset, patch.replacement.data(), patch.replacement.size());
                 touched[r_idx].push_back({ offset, offset + patch.replacement.size() });
                 patched_ranges++;
             }
@@ -390,45 +465,88 @@ bool FirmwarePackage::PackWith(
     }
 
     // Assemble new binary
+    if (progress) progress("Pack firmware container and calculate checksums");
     std::vector<uint8_t> output;
     output.reserve(source_bytes.size());
 
-    for (const auto& rec : mod_records) {
-        std::vector<uint8_t> payload = rec.image;
-        payload.push_back(rec.device_code[0]);
-        payload.push_back(rec.device_code[1]);
+    if (format == FirmwareFormat::Xwdf) {
+        if (mod_records.size() != 1) {
+            out_err = "XWDF requires exactly one ROM image";
+            return false;
+        }
+        if (!XwdfCodec::Repack(source_bytes, mod_records[0].image, output, out_err)) return false;
+    } else if (format == FirmwareFormat::Swdf) {
+        if (mod_records.size() != 1) {
+            out_err = "SWDF requires exactly one image";
+            return false;
+        }
+        const auto& rec = mod_records.front();
+        output.insert(output.end(), rec.image.begin(), rec.image.end());
+        output.push_back(rec.device_code[0]);
+        output.push_back(rec.device_code[1]);
+    } else {
+        for (size_t recordIndex = 0; recordIndex < mod_records.size(); ++recordIndex) {
+            const auto& rec = mod_records[recordIndex];
+            std::vector<uint8_t> payload = rec.image;
+            payload.push_back(rec.device_code[0]);
+            payload.push_back(rec.device_code[1]);
 
-        uint32_t payload_len = (uint32_t)payload.size();
-        WriteBeU32(output, payload_len);
-        output.insert(output.end(), payload.begin(), payload.end());
+            uint32_t payload_len = (uint32_t)payload.size();
+            WriteBeU32(output, payload_len);
+            output.insert(output.end(), payload.begin(), payload.end());
 
-        uint16_t crc = Crc16Ccitt(payload.data(), (size_t)(payload_len & 0xFFFF));
-        WriteBeU16(output, crc);
+            uint16_t crc = Crc16Ccitt(payload.data(), (size_t)(payload_len & 0xFFFF));
+            WriteBeU16(output, crc);
 
-        uint32_t sum = AdditiveChecksum(payload.data(), payload.size());
-        WriteBeU32(output, sum);
+            uint32_t sum = AdditiveChecksum(payload.data(), payload.size());
+            WriteBeU32(output, sum);
 
-        WriteBeU32(output, (uint32_t)rec.marker.size());
-        output.insert(output.end(), rec.marker.begin(), rec.marker.end());
+            if (format == FirmwareFormat::ZwdfStartEnd) {
+                if (recordIndex == 0) {
+                    static constexpr uint8_t boundary[] = {
+                        0, 0, 0, 10, 0, 's', 0, 't', 0, 'a', 0, 'r', 0, 't',
+                        0, 0, 0, 6, 0, 'e', 0, 'n', 0, 'd'
+                    };
+                    output.insert(output.end(), std::begin(boundary), std::end(boundary));
+                }
+            } else {
+                WriteBeU32(output, (uint32_t)rec.marker.size());
+                output.insert(output.end(), rec.marker.begin(), rec.marker.end());
+            }
+        }
     }
 
-    if (output.size() != source_bytes.size()) {
-        out_err = "Repacked firmware size changed unexpectedly";
+    // Editor records can be canonicalized from a reversible native extension,
+    // and the logo builder can append its validated ROM envelope. Source bytes
+    // remain the original import, so ZWDF size follows the current record set.
+    size_t expectedSize = source_bytes.size();
+    if (format == FirmwareFormat::Zwdf) {
+        expectedSize = 0;
+        for (const auto& record : records) expectedSize += record.image.size() + record.marker.size() + 16;
+    }
+    if (output.size() != expectedSize) {
+        out_err = "Repacked firmware size does not match its hardware records";
         return false;
     }
 
     // Strict self-verification
+    if (progress) progress("Validate repacked firmware");
     FirmwarePackage reparsed;
-    if (!FirmwarePackage::Parse(output, reparsed, out_err)) {
+    if (!FirmwarePackage::Parse(output, reparsed, out_err, progress)) {
         out_err = "Self-verification parse failed: " + out_err;
         return false;
     }
 
+    if (reparsed.format != format) {
+        out_err = "Container format changed in self-verification";
+        return false;
+    }
     if (reparsed.records.size() != records.size()) {
         out_err = "Record count changed in self-verification";
         return false;
     }
 
+    if (progress) progress("Verify patched images and unchanged firmware bytes");
     size_t unchanged_verified = 0;
     for (size_t r = 0; r < records.size(); ++r) {
         const auto& old_rec = records[r];
@@ -439,6 +557,10 @@ bool FirmwarePackage::PackWith(
             old_rec.marker != new_rec.marker ||
             old_rec.image.size() != new_rec.image.size()) {
             out_err = "Record metadata mismatch in record " + std::to_string(r);
+            return false;
+        }
+        if (new_rec.image != mod_records[r].image) {
+            out_err = "Patched image mismatch in record " + std::to_string(r);
             return false;
         }
 
@@ -465,8 +587,10 @@ bool FirmwarePackage::PackWith(
     out_bytes = std::move(output);
 
     size_t changed_colors_count = 0;
+    std::set<std::string_view> changed_layouts;
     for (const auto& p : code_patches) {
         if (p.id.rfind("palette_", 0) == 0) changed_colors_count++;
+        if (p.id.starts_with("layout:")) changed_layouts.insert(p.id);
     }
     bool has_bg = false;
     for (const auto& p : code_patches) {
@@ -474,16 +598,24 @@ bool FirmwarePackage::PackWith(
     }
     if (has_bg) changed_colors_count++;
 
+    if (progress) progress("Calculate output firmware SHA-256 and build report");
     out_report.source_sha256 = source_sha256;
     out_report.output_sha256 = ComputeSha256(out_bytes.data(), out_bytes.size());
     out_report.output_size = out_bytes.size();
     out_report.records = mod_records.size();
     out_report.changed_assets = replacements.size();
     out_report.changed_colors = changed_colors_count;
+    out_report.changed_layout_elements = changed_layouts.size();
     out_report.patched_ranges = patched_ranges;
     out_report.unchanged_payload_bytes_verified = unchanged_verified;
 
+    out_report.hardware_codes.clear();
     for (const auto& r : mod_records) {
+        if (format == FirmwareFormat::Xwdf) {
+            const auto end = std::find(r.marker.begin(), r.marker.end(), uint8_t(0));
+            out_report.hardware_codes.emplace_back(r.marker.begin(), end);
+            continue;
+        }
         char code_buf[10];
         snprintf(code_buf, sizeof(code_buf), "%02X%02X", r.device_code[0], r.device_code[1]);
         out_report.hardware_codes.push_back(code_buf);
@@ -492,145 +624,476 @@ bool FirmwarePackage::PackWith(
     return true;
 }
 
-struct KnownColorSites {
-    const char* id;
-    std::vector<size_t> sites[7];
+namespace {
+constexpr size_t kMaxColorVariantCount =
+    sizeof(kFactoryDragXColorHardware) / sizeof(kFactoryDragXColorHardware[0]);
+using ColorVariants = std::array<size_t, kMaxColorVariantCount>;
+
+struct ColorProfile {
+    const ColorHardwareIdentity* hardware;
+    const ColorRoleSites* roles;
+    size_t role_count;
+    FirmwareModel model;
+    FirmwareEdition edition;
+    size_t hardware_count;
+    const FactoryColorHardware* factory = nullptr;
 };
 
-static const KnownColorSites kKnownColorRoles[] = {
-    {
-        "accent_red",
-        {
-            { 0x26ca, 0x554e, 0x5588, 0x56f0, 0x5bca, 0x5c22, 0x5e1a, 0x6358 },
-            { 0x2794, 0x5274, 0x5362, 0x5422, 0x5866, 0x58be, 0x5ab2, 0x600c },
-            { 0x2716, 0x4c28, 0x4d16, 0x4dd2, 0x522e, 0x5286, 0x547a, 0x59d4 },
-            { 0x2794, 0x526c, 0x535a, 0x541a, 0x585e, 0x58b6, 0x5aaa, 0x6004 },
-            { 0x2716, 0x4c20, 0x4d0e, 0x4dca, 0x5226, 0x527e, 0x5472, 0x59cc },
-            { 0x26ca, 0x5576, 0x55b0, 0x5718, 0x5bf2, 0x5c4a, 0x5e42, 0x6380 },
-            { 0x26ca, 0x5576, 0x55b0, 0x5718, 0x5bf2, 0x5c4a, 0x5e42, 0x6380 }
+bool ResolveColorProfile(const FirmwarePackage& fw, ColorProfile& profile,
+                         ColorVariants& variants, std::string& error) {
+    FirmwareModel model;
+    FirmwareEdition edition;
+    if (!DetectFirmwareProfile(fw, model, edition) || model == FirmwareModel::Drag2) {
+        error = "Unsupported firmware hardware identities for color patches";
+        return false;
+    }
+    if (edition == FirmwareEdition::Factory) {
+        profile = { nullptr, nullptr, sizeof(kFactoryColorRoleIds) / sizeof(kFactoryColorRoleIds[0]),
+                    model, edition, model == FirmwareModel::DragX ?
+                    sizeof(kFactoryDragXColorHardware) / sizeof(kFactoryDragXColorHardware[0]) :
+                    sizeof(kFactoryDragSColorHardware) / sizeof(kFactoryDragSColorHardware[0]),
+                    model == FirmwareModel::DragX ? kFactoryDragXColorHardware : kFactoryDragSColorHardware };
+    } else if (model == FirmwareModel::DragX) {
+        profile = { kDragXColorHardware, kDragXColorRoles,
+                    sizeof(kDragXColorRoles) / sizeof(kDragXColorRoles[0]), model, edition,
+                    sizeof(kDragXColorHardware) / sizeof(kDragXColorHardware[0]) };
+    } else {
+        profile = { kDragSColorHardware, kDragSColorRoles,
+                    sizeof(kDragSColorRoles) / sizeof(kDragSColorRoles[0]), model, edition,
+                    sizeof(kDragSColorHardware) / sizeof(kDragSColorHardware[0]) };
+    }
+    if (fw.records.size() != profile.hardware_count || fw.records.size() > variants.size()) {
+        error = "Unsupported firmware record count for color patches";
+        return false;
+    }
+    std::array<bool, kMaxColorVariantCount> seen{};
+    for (size_t r = 0; r < fw.records.size(); ++r) {
+        const auto& rec = fw.records[r];
+        const uint16_t code = (uint16_t)((rec.device_code[0] << 8) | rec.device_code[1]);
+        size_t variant = 0;
+        while (variant < profile.hardware_count) {
+            const auto& identity = profile.factory ? profile.factory[variant].identity : profile.hardware[variant];
+            if (identity.code == code) break;
+            ++variant;
         }
-    },
-    {
-        "accent_cyan",
-        {
-            { 0x26c2, 0x5546, 0x5796, 0x5bc2, 0x5d84, 0x5fb6, 0x6350 },
-            { 0x278c, 0x5354, 0x54d2, 0x585e, 0x5a1c, 0x5c06, 0x6004 },
-            { 0x270e, 0x4d08, 0x4e76, 0x5226, 0x53e4, 0x55ce, 0x59cc },
-            { 0x278c, 0x534c, 0x54ca, 0x5856, 0x5a14, 0x5bfe, 0x5ffc },
-            { 0x270e, 0x4d00, 0x4e6e, 0x521e, 0x53dc, 0x55c6, 0x59c4 },
-            { 0x26c2, 0x556e, 0x57be, 0x5bea, 0x5dac, 0x5fde, 0x6378 },
-            { 0x26c2, 0x556e, 0x57be, 0x5bea, 0x5dac, 0x5fde, 0x6378 }
+        if (variant == profile.hardware_count || seen[variant]) {
+            error = "Unsupported or duplicate color hardware identity in record " + std::to_string(r);
+            return false;
         }
-    },
-    {
-        "highlight_yellow",
-        {
-            { 0x621c, 0x8780, 0x87c4, 0x88b6 },
-            { 0x5eca, 0x77fc, 0x783e, 0x7928 },
-            { 0x5892, 0x7220, 0x7262, 0x734c },
-            { 0x5ec2, 0x77f4, 0x7836, 0x7920 },
-            { 0x588a, 0x7218, 0x725a, 0x7344 },
-            { 0x6244, 0x87a8, 0x87ec, 0x88de },
-            { 0x6244, 0x87a8, 0x87ec, 0x88de }
+        const auto& identity = profile.factory ? profile.factory[variant].identity : profile.hardware[variant];
+        if (rec.image.size() != identity.image_size || rec.linked_base != identity.linked_base) {
+            error = "Unsupported color layout in hardware record " + std::to_string(r);
+            return false;
         }
-    },
-    {
-        "rank_bronze",
-        {
-            { 0x5db8 }, { 0x5a50 }, { 0x5418 }, { 0x5a48 }, { 0x5410 }, { 0x5de0 }, { 0x5de0 }
-        }
-    },
-    {
-        "rank_gold",
-        {
-            { 0x5dc6 },
-            { 0x34d2, 0x5a5e },
-            { 0x5426 },
-            { 0x34d2, 0x5a56 },
-            { 0x541e },
-            { 0x5dee },
-            { 0x5dee }
-        }
-    },
-    {
-        "rank_ice",
-        {
-            { 0x5dd4 }, { 0x5a6c }, { 0x5434 }, { 0x5a64 }, { 0x542c }, { 0x5dfc }, { 0x5dfc }
-        }
-    },
-    {
-        "rank_cyan",
-        {
-            { 0x5de2 }, { 0x5a7a }, { 0x5442 }, { 0x5a72 }, { 0x543a }, { 0x5e0a }, { 0x5e0a }
-        }
-    },
-    {
-        "rank_orange",
-        {
-            { 0x5df0 }, { 0x5a88 }, { 0x5450 }, { 0x5a80 }, { 0x5448 }, { 0x5e18 }, { 0x5e18 }
-        }
-    },
-    {
-        "rank_red",
-        {
-            { 0x5dfe }, { 0x5a96 }, { 0x545e }, { 0x5a8e }, { 0x5456 }, { 0x5e26 }, { 0x5e26 }
+        seen[variant] = true;
+        variants[r] = variant;
+    }
+    return true;
+}
+
+size_t ColorSiteLength(ColorEncoding encoding) {
+    return encoding == ColorEncoding::Rgb ? 6 : encoding == ColorEncoding::SplitRgb ? 8 : 4;
+}
+
+bool ReadColorSite(const HardwareRecord& rec, const ColorPatchSite& site,
+                   ColorEncoding encoding, Rgb8& color) {
+    const size_t length = ColorSiteLength(encoding);
+    if (site.offset < 2 || site.offset + length + 2 > rec.image.size()) return false;
+    const auto* code = rec.image.data() + site.offset;
+    const uint16_t before = (uint16_t)(code[-2] | (code[-1] << 8));
+    const uint16_t after = (uint16_t)(code[length] | (code[length + 1] << 8));
+    if ((before & site.before_mask) != site.before || (after & site.after_mask) != site.after)
+        return false;
+    if (encoding == ColorEncoding::Rgb) return DecodeColorInstruction(code, color);
+    if (encoding == ColorEncoding::SplitRgb) {
+        if (code[1] != 0x22 || code[2] != 0x1c || code[3] != 0xbf ||
+            code[5] != 0x21 || code[7] != 0x20) return false;
+        color = { code[6], code[4], code[0] };
+        return true;
+    }
+    uint16_t rgb565 = 0;
+    if (!DecodeMovwInstruction(code, encoding == ColorEncoding::Movw8 ? 8 : 7, rgb565))
+        return false;
+    color = Rgb8::FromRgb565(rgb565);
+    return true;
+}
+
+std::vector<uint8_t> EncodeColorSite(ColorEncoding encoding, Rgb8 color) {
+    if (encoding == ColorEncoding::Rgb) return ColorInstruction(color);
+    if (encoding == ColorEncoding::SplitRgb)
+        return { color.b, 0x22, 0x1c, 0xbf, color.g, 0x21, color.r, 0x20 };
+    return MovwInstruction(encoding == ColorEncoding::Movw8 ? 8 : 7, color.ToRgb565());
+}
+
+bool ReadPaletteColor(const FirmwarePackage& fw, const ColorProfile& profile,
+                      const ColorVariants& variants,
+                      const char* id, Rgb8& color, bool& found, std::string& error) {
+    found = false;
+    for (size_t i = 0; i < profile.role_count; ++i) {
+        const auto& role = profile.roles[i];
+        if (std::strcmp(id, role.id) != 0) continue;
+        for (size_t r = 0; r < fw.records.size(); ++r) {
+            for (const auto& site : role.sites[variants[r]]) {
+                if (!site.offset) break;
+                Rgb8 current;
+                if (!ReadColorSite(fw.records[r], site, role.encoding, current)) {
+                    error = std::string(id) + ": instruction/context mismatch in record " + std::to_string(r);
+                    return false;
+                }
+                if (found && current != color) {
+                    error = std::string(id) + ": inconsistent colors across hardware sites";
+                    return false;
+                }
+                color = current;
+                found = true;
+            }
         }
     }
-};
+    return true;
+}
 
-static const size_t kWattageDigitSites[7] = { 0x567c, 0x53b0, 0x4d64, 0x53a8, 0x4d5c, 0x56a4, 0x56a4 };
-static const size_t kStatsDigitSites[7]   = { 0x5ca0, 0x5944, 0x530c, 0x593c, 0x5304, 0x5cc8, 0x5cc8 };
+// Only DRAG S could have received the historical, broken background injection.
+// Keep its recovery, but select each site by hardware code, never record order.
+bool AppendLegacyBackgroundRepairs(const FirmwarePackage& fw,
+                                  const ColorVariants& variants,
+                                  std::vector<CodePatch>& patches, std::string& error) {
+    size_t primary = 0;
+    while (primary < fw.records.size() && variants[primary] != 0) ++primary;
+    const uint8_t digit_prefix[] = { 0xe8, 0x07, 0x44, 0xbf, 0x0e, 0x98 };
+    if (primary == fw.records.size() ||
+        std::memcmp(fw.records[primary].image.data() + 0x4384, digit_prefix, sizeof(digit_prefix)) != 0)
+        return true;
+    struct Repair {
+        const char* id;
+        uint8_t stock[10];
+        size_t sites[kScoreColorVariantCount][2];
+    };
+    static constexpr Repair repairs[] = {
+        { "revert_background_digit_stack",
+          { 0x15, 0xf0, 0x01, 0x0f, 0x14, 0xbf, 0x0e, 0x98, 0x58, 0x46 },
+          { {0x4384}, {}, {}, {}, {}, {0x436c}, {0x436c} } },
+        { "revert_background_bitmap_stack",
+          { 0x14, 0xf0, 0x01, 0x0f, 0x14, 0xbf, 0x10, 0x98, 0x58, 0x46 },
+          { {0x4776}, {}, {}, {}, {}, {0x475e}, {0x475e} } },
+        { "revert_background_register",
+          { 0x15, 0xf0, 0x01, 0x0f, 0x14, 0xbf, 0x58, 0x46, 0x50, 0x46 },
+          { {}, {0x42e4, 0x46fc}, {0x3cbc, 0x40d4}, {0x42e4, 0x46fc},
+            {0x3cbc, 0x40d4}, {}, {} } }
+    };
+    for (const auto& repair : repairs) {
+        CodePatch patch;
+        patch.id = repair.id;
+        patch.replacement.assign(repair.stock, repair.stock + sizeof(repair.stock));
+        patch.locations.resize(fw.records.size());
+        for (size_t r = 0; r < fw.records.size(); ++r) {
+            for (size_t offset : repair.sites[variants[r]]) {
+                if (!offset) break;
+                const auto* code = fw.records[r].image.data() + offset;
+                if (patch.original.empty()) patch.original.assign(code, code + sizeof(repair.stock));
+                else if (std::memcmp(code, patch.original.data(), patch.original.size()) != 0) {
+                    error = patch.id + ": inconsistent legacy patch in record " + std::to_string(r);
+                    return false;
+                }
+                patch.locations[r].push_back(offset);
+            }
+        }
+        patches.push_back(std::move(patch));
+    }
+    return true;
+}
+
+constexpr size_t kFactoryColorRoleCount = sizeof(kFactoryColorRoleIds) / sizeof(kFactoryColorRoleIds[0]);
+
+size_t FactoryColorSiteLength(FactoryColorEncoding encoding) {
+    return encoding == FactoryColorEncoding::Rgb ? 6 :
+           encoding == FactoryColorEncoding::SplitRgb ? 8 :
+           encoding == FactoryColorEncoding::Literal565 ? 2 : 4;
+}
+
+void FactoryStockBytes(const FactoryColorSite& site, std::array<uint8_t, 8>& bytes) {
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (uint8_t)(site.stock >> (i * 8));
+}
+
+Rgb8 FactoryColorBaseline(size_t role) {
+    return role == 5 ? Rgb8(0x76, 0xff, 0) : Rgb8::FromRgb565(kFactoryColorBaselines[role]);
+}
+
+Rgb8 FactoryComparableColor(size_t role, Rgb8 color) {
+    // Only the independent legacy service green is exclusively RGB888.
+    return role == 5 ? color : color.ScreenColor();
+}
+
+bool MatchesFactoryContext(const HardwareRecord& rec, size_t offset, uint32_t expected, uint32_t mask) {
+    const auto* source = rec.image.data() + offset;
+    if ((ReadLeU32(source) & mask) == expected) return true;
+    std::array<uint8_t, 4> normalized;
+    std::copy_n(source, normalized.size(), normalized.data());
+    return FirmwareLayout::NormalizeSxLayoutContext(rec, rec.linked_base + static_cast<uint32_t>(offset),
+        normalized.data(), normalized.size()) && (ReadLeU32(normalized.data()) & mask) == expected;
+}
+
+bool ReadFactoryColorSite(const HardwareRecord& rec, const FactoryColorSite& site,
+                          Rgb8& color, bool& stock) {
+    const size_t length = FactoryColorSiteLength(site.encoding);
+    if (site.offset < 4 || site.offset + length + 4 > rec.image.size()) return false;
+    const auto* code = rec.image.data() + site.offset;
+    if (!MatchesFactoryContext(rec, site.offset - 4, site.before, site.before_mask) ||
+        !MatchesFactoryContext(rec, site.offset + length, site.after, site.after_mask)) return false;
+    if (site.reference_offset &&
+        (site.reference_offset + 4 > rec.image.size() ||
+         !MatchesFactoryContext(rec, site.reference_offset, site.reference, UINT32_MAX))) return false;
+    std::array<uint8_t, 8> original{};
+    FactoryStockBytes(site, original);
+    stock = std::memcmp(code, original.data(), length) == 0;
+    if (site.encoding == FactoryColorEncoding::Rgb) return DecodeColorInstruction(code, color);
+    if (site.encoding == FactoryColorEncoding::SplitRgb) {
+        if (code[1] != 0x22 || code[2] != 0x1c || code[3] != 0xbf ||
+            code[5] != 0x21 || code[7] != 0x20) return false;
+        color = { code[6], code[4], code[0] };
+        return true;
+    }
+    uint16_t value;
+    if (site.encoding == FactoryColorEncoding::Literal565) {
+        value = (uint16_t)(code[0] | (code[1] << 8));
+    } else if ((code[3] & 0x80) != 0 || !DecodeMovwInstruction(code, site.reg, value)) {
+        // The sole modified-immediate encoding in these profiles is MOV.W
+        // #0xe800. Accept its exact stock bytes, or a same-register MOVW edit.
+        if (!stock || site.role != 0) return false;
+        value = 0xe800;
+    }
+    color = Rgb8::FromRgb565(value);
+    return true;
+}
+
+bool ReadFactoryPaletteColor(const FirmwarePackage& fw, const ColorProfile& profile,
+                             const ColorVariants& variants, size_t role, Rgb8& color,
+                             std::string& error) {
+    bool found = false, all_stock = true, uniform = true;
+    Rgb8 first, firstRgb;
+    bool foundRgb = false, uniformRgb = true;
+    for (size_t r = 0; r < fw.records.size(); ++r) {
+        const auto& hardware = profile.factory[variants[r]];
+        for (size_t i = 0; i < hardware.site_count; ++i) {
+            const auto& site = hardware.sites[i];
+            if (site.role != role) continue;
+            Rgb8 current;
+            bool stock;
+            if (!ReadFactoryColorSite(fw.records[r], site, current, stock)) {
+                error = std::string(kFactoryColorRoleIds[role]) +
+                        ": Factory instruction/context mismatch in record " + std::to_string(r);
+                return false;
+            }
+            if (site.encoding == FactoryColorEncoding::Rgb || site.encoding == FactoryColorEncoding::SplitRgb) {
+                if (foundRgb && current != firstRgb) uniformRgb = false;
+                if (!foundRgb) firstRgb = current;
+                foundRgb = true;
+            }
+            current = FactoryComparableColor(role, current);
+            if (found && current != first) uniform = false;
+            if (!found) first = current;
+            found = true;
+            all_stock = all_stock && stock;
+        }
+    }
+    // Factory stock intentionally has hardware-specific RGB888 / RGB565
+    // values. Preserve that complete stock pattern; otherwise every site must
+    // agree on the user-selected display color, including on reopening.
+    if (!found || (!all_stock && !uniform)) {
+        error = std::string(kFactoryColorRoleIds[role]) + ": inconsistent Factory colors across hardware sites";
+        return false;
+    }
+    // RGB565 establishes display equivalence across mixed encodings, but it
+    // cannot reconstruct the original RGB888 operands. Keep their exact value
+    // when unambiguous so native executable guards and re-export remain strict.
+    color = all_stock ? FactoryColorBaseline(role) : foundRgb && uniformRgb ? firstRgb : first;
+    return true;
+}
+
+bool ReadFactoryPalette(const FirmwarePackage& fw, const ColorProfile& profile,
+                        const ColorVariants& variants,
+                        std::array<Rgb8, kFactoryColorRoleCount>& colors, std::string& error) {
+    for (size_t role = 0; role < colors.size(); ++role) {
+        if (!ReadFactoryPaletteColor(fw, profile, variants, role, colors[role], error)) return false;
+    }
+    return true;
+}
+
+void EncodeFactoryColorSite(const FactoryColorSite& site, Rgb8 color, bool restore,
+                            std::array<uint8_t, 8>& bytes) {
+    if (restore) {
+        FactoryStockBytes(site, bytes);
+        return;
+    }
+    if (site.encoding == FactoryColorEncoding::Rgb) {
+        bytes = { color.b, 0x22, color.g, 0x21, color.r, 0x20 };
+    } else if (site.encoding == FactoryColorEncoding::SplitRgb) {
+        bytes = { color.b, 0x22, 0x1c, 0xbf, color.g, 0x21, color.r, 0x20 };
+    } else {
+        const uint16_t value = color.ToRgb565();
+        if (site.encoding == FactoryColorEncoding::Literal565) {
+            bytes[0] = (uint8_t)value;
+            bytes[1] = (uint8_t)(value >> 8);
+        } else {
+            const uint16_t first = (uint16_t)(0xf240 | ((value >> 11 & 1) << 10) | (value >> 12));
+            const uint16_t second = (uint16_t)(((value >> 8 & 7) << 12) | (site.reg << 8) | (value & 0xff));
+            bytes[0] = (uint8_t)first;
+            bytes[1] = (uint8_t)(first >> 8);
+            bytes[2] = (uint8_t)second;
+            bytes[3] = (uint8_t)(second >> 8);
+        }
+    }
+}
+
+bool BuildFactoryColorPatches(const FirmwarePackage& fw, const ColorProfile& profile,
+                              const ColorVariants& variants, const std::vector<PaletteState>& palette,
+                              std::vector<CodePatch>& out_patches, std::string& error) {
+    std::array<Rgb8, kFactoryColorRoleCount> colors{};
+    if (!ReadFactoryPalette(fw, profile, variants, colors, error)) return false;
+    std::vector<CodePatch> patches;
+    for (const auto& entry : palette) {
+        size_t role = 0;
+        while (role < colors.size() && std::strcmp(entry.spec.id, kFactoryColorRoleIds[role]) != 0) ++role;
+        if (role == colors.size()) {
+            if (entry.current != entry.spec.original) {
+                error = std::string("Unsupported Factory palette role: ") + entry.spec.id;
+                return false;
+            }
+            continue;
+        }
+        if (FactoryComparableColor(role, entry.current) == FactoryComparableColor(role, colors[role])) continue;
+        const bool restore = FactoryComparableColor(role, entry.current) == FactoryColorBaseline(role);
+        const size_t role_begin = patches.size();
+        for (size_t r = 0; r < fw.records.size(); ++r) {
+            const auto& hardware = profile.factory[variants[r]];
+            for (size_t i = 0; i < hardware.site_count; ++i) {
+                const auto& site = hardware.sites[i];
+                if (site.role != role) continue;
+                const size_t length = FactoryColorSiteLength(site.encoding);
+                const auto* original = fw.records[r].image.data() + site.offset;
+                std::array<uint8_t, 8> replacement{};
+                EncodeFactoryColorSite(site, entry.current, restore, replacement);
+                if (std::memcmp(original, replacement.data(), length) == 0) continue;
+                // Group identical instructions across hardware rather than
+                // allocating a patch and record-location vector for every site.
+                size_t group = role_begin;
+                while (group < patches.size() &&
+                       (patches[group].original.size() != length ||
+                        std::memcmp(patches[group].original.data(), original, length) != 0 ||
+                        std::memcmp(patches[group].replacement.data(), replacement.data(), length) != 0)) ++group;
+                if (group == patches.size()) {
+                    CodePatch patch;
+                    patch.id = std::string(group == role_begin ? "palette_" : "patch_") +
+                               kFactoryColorRoleIds[role];
+                    patch.original.assign(original, original + length);
+                    patch.replacement.assign(replacement.begin(), replacement.begin() + length);
+                    patch.locations.resize(fw.records.size());
+                    patches.push_back(std::move(patch));
+                }
+                patches[group].locations[r].push_back(site.offset);
+            }
+        }
+    }
+    out_patches = std::move(patches);
+    return true;
+}
+} // namespace
+
+bool FirmwareRecordPaletteColor(const FirmwarePackage& fw, uint16_t deviceCode,
+                                const char* roleId, Rgb8& color) {
+    FirmwareModel model;
+    if (DetectFirmwareModel(fw, model))
+        if (const auto* extension = FirmwareExtensionFor(model))
+            return extension->recordColor(fw, deviceCode, roleId, color);
+    ColorProfile profile{};
+    ColorVariants variants{};
+    std::string error;
+    if (!ResolveColorProfile(fw, profile, variants, error)) return false;
+    for (size_t r = 0; r < fw.records.size(); ++r) {
+        const auto& rec = fw.records[r];
+        if ((uint16_t)((rec.device_code[0] << 8) | rec.device_code[1]) != deviceCode) continue;
+        if (profile.factory) {
+            size_t role = 0;
+            while (role < profile.role_count && std::strcmp(roleId, kFactoryColorRoleIds[role]) != 0) ++role;
+            if (role == profile.role_count) return false;
+            const auto& hardware = profile.factory[variants[r]];
+            for (size_t i = 0; i < hardware.site_count; ++i) {
+                const auto& site = hardware.sites[i];
+                if (site.role != role) continue;
+                bool stock;
+                return ReadFactoryColorSite(rec, site, color, stock);
+            }
+        } else {
+            for (size_t i = 0; i < profile.role_count; ++i) {
+                const auto& role = profile.roles[i];
+                if (std::strcmp(roleId, role.id) != 0) continue;
+                const auto& site = role.sites[variants[r]][0];
+                if (site.offset) return ReadColorSite(rec, site, role.encoding, color);
+            }
+        }
+        return false;
+    }
+    return false;
+}
 
 bool DetectFirmwareColors(
     const FirmwarePackage& fw,
     std::vector<PaletteState>& palette,
     Rgb8& background
 ) {
-    if (fw.records.size() != 7) return false;
-
+    FirmwareModel model;
+    if (DetectFirmwareModel(fw, model)) {
+        if (const auto* extension = FirmwareExtensionFor(model))
+            return extension->detectColors(fw, palette, background);
+        if (model == FirmwareModel::Drag2) return DetectDrag2FirmwareColors(fw, palette, background);
+    }
+    ColorProfile profile{};
+    ColorVariants variants{};
+    std::string error;
+    if (!ResolveColorProfile(fw, profile, variants, error)) return false;
+    if (profile.factory) {
+        std::array<Rgb8, kFactoryColorRoleCount> colors{};
+        if (!ReadFactoryPalette(fw, profile, variants, colors, error)) return false;
+        static constexpr const char* labels[] = {
+            "Red accent", "Cyan accent", "Main digits", "Small digits", "Yellow highlight", "Legacy green"
+        };
+        static constexpr const char* scopes[] = {
+            "Factory mode labels, panels and graphs",
+            "Factory alternate mode labels and panels",
+            "Large readout, clock and model header",
+            "6x10 and 7x13 readouts and units",
+            "Factory service panels",
+            "Independent green controls on legacy hardware"
+        };
+        palette.clear();
+        palette.reserve(colors.size());
+        for (size_t role = 0; role < colors.size(); ++role)
+            palette.push_back({{kFactoryColorRoleIds[role], labels[role], scopes[role], colors[role]}, colors[role]});
+        background = { 0, 0, 0 };
+        return true;
+    }
+    // Validate every role before changing caller state, including both encodings
+    // of the X red accent. A partial or mismatched palette is not a valid profile.
+    std::array<Rgb8, sizeof(kDragXColorRoles) / sizeof(kDragXColorRoles[0])> colors{};
+    for (size_t i = 0; i < profile.role_count; ++i) {
+        size_t previous = 0;
+        while (previous < i && std::strcmp(profile.roles[previous].id, profile.roles[i].id) != 0)
+            ++previous;
+        if (previous < i) {
+            colors[i] = colors[previous];
+            continue;
+        }
+        bool found = false;
+        if (!ReadPaletteColor(fw, profile, variants, profile.roles[i].id, colors[i], found, error) || !found)
+            return false;
+    }
     for (auto& entry : palette) {
-        if (std::string(entry.spec.id) == "digits_wattage") {
-            size_t off = kWattageDigitSites[0];
-            if (off + 4 <= fw.records[0].image.size()) {
-                uint16_t imm16 = 0;
-                if (DecodeMovwInstruction(&fw.records[0].image[off], 8, imm16)) {
-                    Rgb8 c = Rgb8::FromRgb565(imm16);
-                    entry.current = c;
-                    entry.spec.original = c;
-                }
-            }
-            continue;
-        }
-
-        if (std::string(entry.spec.id) == "digits_stats") {
-            size_t off = kStatsDigitSites[0];
-            if (off + 4 <= fw.records[0].image.size()) {
-                uint16_t imm16 = 0;
-                if (DecodeMovwInstruction(&fw.records[0].image[off], 7, imm16)) {
-                    Rgb8 c = Rgb8::FromRgb565(imm16);
-                    entry.current = c;
-                    entry.spec.original = c;
-                }
-            }
-            continue;
-        }
-
-        for (const auto& role : kKnownColorRoles) {
-            if (entry.spec.id == std::string(role.id)) {
-                size_t off = role.sites[0][0];
-                if (off + 6 <= fw.records[0].image.size()) {
-                    Rgb8 c;
-                    if (DecodeColorInstruction(&fw.records[0].image[off], c)) {
-                        entry.current = c;
-                        entry.spec.original = c;
-                    }
-                }
-                break;
-            }
+        for (size_t i = 0; i < profile.role_count; ++i) {
+            if (std::strcmp(entry.spec.id, profile.roles[i].id) != 0) continue;
+            entry.current = entry.spec.original = colors[i];
+            break;
         }
     }
-
-    background = Rgb8(0, 0, 0);
+    background = { 0, 0, 0 };
     return true;
 }
 
@@ -641,226 +1104,61 @@ bool BuildColorPatches(
     std::vector<CodePatch>& out_patches,
     std::string& out_err
 ) {
+    FirmwareModel model;
+    if (DetectFirmwareModel(fw, model)) {
+        if (const auto* extension = FirmwareExtensionFor(model))
+            return extension->buildColors(fw, palette, background, out_patches, out_err);
+        if (model == FirmwareModel::Drag2)
+            return BuildDrag2ColorPatches(fw, palette, background, out_patches, out_err);
+    }
+    ColorProfile profile{};
+    ColorVariants variants{};
+    if (!ResolveColorProfile(fw, profile, variants, out_err)) return false;
+    if (background != Rgb8(0, 0, 0)) {
+        out_err = "Only the firmware's black background is supported";
+        return false;
+    }
+    if (profile.factory)
+        return BuildFactoryColorPatches(fw, profile, variants, palette, out_patches, out_err);
     std::vector<CodePatch> patches;
-
-    if (fw.records.size() == 7) {
-        for (const auto& entry : palette) {
-            if (std::string(entry.spec.id) == "digits_wattage") {
-                size_t off0 = kWattageDigitSites[0];
-                if (off0 + 4 > fw.records[0].image.size()) {
-                    out_err = "Firmware image 0 too small for wattage digit site";
-                    return false;
-                }
-                uint16_t curr_imm16 = 0;
-                if (!DecodeMovwInstruction(&fw.records[0].image[off0], 8, curr_imm16)) {
-                    out_err = "Cannot decode wattage digit instruction in record 0";
-                    return false;
-                }
-                if (curr_imm16 == entry.current.ToRgb565()) {
-                    continue;
-                }
-                CodePatch p;
-                p.id = "patch_digits_wattage";
-                p.original.assign(&fw.records[0].image[off0], &fw.records[0].image[off0] + 4);
-                p.replacement = MovwInstruction(8, entry.current.ToRgb565());
-                for (size_t r = 0; r < 7; ++r) {
-                    size_t off = kWattageDigitSites[r];
-                    if (off + 4 > fw.records[r].image.size() ||
-                        std::memcmp(&fw.records[r].image[off], p.original.data(), 4) != 0) {
-                        out_err = "Wattage digit instruction mismatch in record " + std::to_string(r);
-                        return false;
-                    }
-                    p.locations.push_back({ off });
-                }
-                patches.push_back(p);
-                continue;
-            }
-
-            if (std::string(entry.spec.id) == "digits_stats") {
-                size_t off0 = kStatsDigitSites[0];
-                if (off0 + 4 > fw.records[0].image.size()) {
-                    out_err = "Firmware image 0 too small for stats digit site";
-                    return false;
-                }
-                uint16_t curr_imm16 = 0;
-                if (!DecodeMovwInstruction(&fw.records[0].image[off0], 7, curr_imm16)) {
-                    out_err = "Cannot decode stats digit instruction in record 0";
-                    return false;
-                }
-                if (curr_imm16 == entry.current.ToRgb565()) {
-                    continue;
-                }
-                CodePatch p;
-                p.id = "patch_digits_stats";
-                p.original.assign(&fw.records[0].image[off0], &fw.records[0].image[off0] + 4);
-                p.replacement = MovwInstruction(7, entry.current.ToRgb565());
-                for (size_t r = 0; r < 7; ++r) {
-                    size_t off = kStatsDigitSites[r];
-                    if (off + 4 > fw.records[r].image.size() ||
-                        std::memcmp(&fw.records[r].image[off], p.original.data(), 4) != 0) {
-                        out_err = "Stats digit instruction mismatch in record " + std::to_string(r);
-                        return false;
-                    }
-                    p.locations.push_back({ off });
-                }
-                patches.push_back(p);
-                continue;
-            }
-
-            const KnownColorSites* role_def = nullptr;
-            for (const auto& rk : kKnownColorRoles) {
-                if (entry.spec.id == std::string(rk.id)) {
-                    role_def = &rk;
-                    break;
-                }
-            }
-            if (!role_def) continue;
-
-            size_t off0 = role_def->sites[0][0];
-            if (off0 + 6 > fw.records[0].image.size()) {
-                out_err = "Firmware image 0 too small for " + std::string(entry.spec.label);
+    for (const auto& entry : palette) {
+        Rgb8 current;
+        bool found = false;
+        if (!ReadPaletteColor(fw, profile, variants, entry.spec.id, current, found, out_err)) return false;
+        if (!found) {
+            if (entry.current != entry.spec.original) {
+                out_err = std::string("Unsupported firmware palette role: ") + entry.spec.id;
                 return false;
             }
-            Rgb8 curr_c;
-            if (!DecodeColorInstruction(&fw.records[0].image[off0], curr_c)) {
-                out_err = "Cannot decode existing color for " + std::string(entry.spec.label) + " in record 0";
-                return false;
-            }
-            if (curr_c == entry.current) {
-                continue;
-            }
-
-            CodePatch p;
-            p.id = std::string("palette_") + entry.spec.id;
-            p.original.assign(&fw.records[0].image[off0], &fw.records[0].image[off0] + 6);
-            p.replacement = ColorInstruction(entry.current);
-
-            for (size_t r = 0; r < 7; ++r) {
-                const auto& rec_sites = role_def->sites[r];
-                for (size_t s_off : rec_sites) {
-                    if (s_off + 6 > fw.records[r].image.size() ||
-                        std::memcmp(&fw.records[r].image[s_off], p.original.data(), 6) != 0) {
-                        out_err = std::string(entry.spec.label) + " signature mismatch in record " + std::to_string(r);
-                        return false;
-                    }
-                }
-                p.locations.push_back(rec_sites);
-            }
-            patches.push_back(p);
+            continue;
         }
-
-        // Auto-revert any previously injected broken background patches to clean factory stock instructions
-        const uint8_t bg_patched_prefix_digit[6] = { 0xe8, 0x07, 0x44, 0xbf, 0x0e, 0x98 };
-        const uint8_t bg_stock_digit[10]  = { 0x15, 0xf0, 0x01, 0x0f, 0x14, 0xbf, 0x0e, 0x98, 0x58, 0x46 };
-        const uint8_t bg_stock_bitmap[10] = { 0x14, 0xf0, 0x01, 0x0f, 0x14, 0xbf, 0x10, 0x98, 0x58, 0x46 };
-        const uint8_t bg_stock_reg[10]    = { 0x15, 0xf0, 0x01, 0x0f, 0x14, 0xbf, 0x58, 0x46, 0x50, 0x46 };
-
-        if (0x4384 + 10 <= fw.records[0].image.size() &&
-            std::memcmp(&fw.records[0].image[0x4384], bg_patched_prefix_digit, 6) == 0) {
-            // 1. Digit stack (Rec 0, 5, 6)
-            {
-                CodePatch p;
-                p.id = "revert_background_digit_stack";
-                p.original.assign(&fw.records[0].image[0x4384], &fw.records[0].image[0x4384] + 10);
-                p.replacement.assign(bg_stock_digit, bg_stock_digit + 10);
-
-                p.locations.resize(7);
-                p.locations[0] = { 0x4384 };
-                p.locations[5] = { 0x436c };
-                p.locations[6] = { 0x436c };
-                patches.push_back(p);
-            }
-
-            // 2. Bitmap stack (Rec 0, 5, 6)
-            {
-                CodePatch p;
-                p.id = "revert_background_bitmap_stack";
-                p.original.assign(&fw.records[0].image[0x4776], &fw.records[0].image[0x4776] + 10);
-                p.replacement.assign(bg_stock_bitmap, bg_stock_bitmap + 10);
-
-                p.locations.resize(7);
-                p.locations[0] = { 0x4776 };
-                p.locations[5] = { 0x475e };
-                p.locations[6] = { 0x475e };
-                patches.push_back(p);
-            }
-
-            // 3. Register stack (Rec 1, 2, 3, 4)
-            {
-                CodePatch p;
-                p.id = "revert_background_register";
-                p.original.assign(&fw.records[1].image[0x42e4], &fw.records[1].image[0x42e4] + 10);
-                p.replacement.assign(bg_stock_reg, bg_stock_reg + 10);
-
-                p.locations.resize(7);
-                p.locations[1] = { 0x42e4, 0x46fc };
-                p.locations[2] = { 0x3cbc, 0x40d4 };
-                p.locations[3] = { 0x42e4, 0x46fc };
-                p.locations[4] = { 0x3cbc, 0x40d4 };
-                patches.push_back(p);
-            }
-        }
-    } else {
-        for (const auto& entry : palette) {
-            if (entry.current == entry.spec.original) continue;
-
-            if (std::string(entry.spec.id) == "digits_wattage") {
-                CodePatch p;
-                p.id = "patch_digits_wattage";
-                p.original = MovwInstruction(8, 0xFFFF);
-                p.replacement = MovwInstruction(8, entry.current.ToRgb565());
-                const size_t watt_offsets[] = { 0x567c, 0x53b0, 0x4d64, 0x53a8, 0x4d5c, 0x56a4, 0x56a4 };
-                for (size_t r = 0; r < fw.records.size(); ++r) {
-                    size_t off = (r < 7) ? watt_offsets[r] : 0;
-                    if (off + 4 <= fw.records[r].image.size() &&
-                        std::equal(p.original.begin(), p.original.end(), fw.records[r].image.begin() + off)) {
-                        p.locations.push_back({ off });
-                    } else {
-                        out_err = "Cannot locate wattage digit instruction in record " + std::to_string(r);
-                        return false;
-                    }
-                }
-                patches.push_back(p);
-                continue;
-            }
-
-            if (std::string(entry.spec.id) == "digits_stats") {
-                CodePatch p;
-                p.id = "patch_digits_stats";
-                p.original = MovwInstruction(7, 0xFFFF);
-                p.replacement = MovwInstruction(7, entry.current.ToRgb565());
-                const size_t stats_offsets[] = { 0x5ca0, 0x5944, 0x530c, 0x593c, 0x5304, 0x5cc8, 0x5cc8 };
-                for (size_t r = 0; r < fw.records.size(); ++r) {
-                    size_t off = (r < 7) ? stats_offsets[r] : 0;
-                    if (off + 4 <= fw.records[r].image.size() &&
-                        std::equal(p.original.begin(), p.original.end(), fw.records[r].image.begin() + off)) {
-                        p.locations.push_back({ off });
-                    } else {
-                        out_err = "Cannot locate stats digit instruction in record " + std::to_string(r);
-                        return false;
-                    }
-                }
-                patches.push_back(p);
-                continue;
-            }
-
-            CodePatch p;
-            p.id = std::string("palette_") + entry.spec.id;
-            p.original = ColorInstruction(entry.spec.original);
-            p.replacement = ColorInstruction(entry.current);
-
+        const bool digit = std::strcmp(entry.spec.id, "digits_wattage") == 0 ||
+                           std::strcmp(entry.spec.id, "digits_stats") == 0;
+        if (digit ? current.ToRgb565() == entry.current.ToRgb565() : current == entry.current) continue;
+        for (size_t i = 0; i < profile.role_count; ++i) {
+            const auto& role = profile.roles[i];
+            if (std::strcmp(entry.spec.id, role.id) != 0) continue;
+            CodePatch patch;
+            // The extra split-red patch is not a second changed palette role.
+            patch.id = std::string(role.encoding == ColorEncoding::SplitRgb ? "patch_split_" :
+                                   digit ? "patch_" : "palette_") + role.id;
+            patch.replacement = EncodeColorSite(role.encoding, entry.current);
+            patch.locations.resize(fw.records.size());
             for (size_t r = 0; r < fw.records.size(); ++r) {
-                auto locs = fw.FindAll(r, p.original.data(), p.original.size());
-                if (locs.empty()) {
-                    out_err = std::string(entry.spec.label) + " signature is missing in hardware record " + std::to_string(r);
-                    return false;
+                for (const auto& site : role.sites[variants[r]]) {
+                    if (!site.offset) break;
+                    if (patch.original.empty()) {
+                        const auto* code = fw.records[r].image.data() + site.offset;
+                        patch.original.assign(code, code + ColorSiteLength(role.encoding));
+                    }
+                    patch.locations[r].push_back(site.offset);
                 }
-                p.locations.push_back(locs);
             }
-            patches.push_back(p);
+            patches.push_back(std::move(patch));
         }
     }
-
+    if (profile.model == FirmwareModel::DragS &&
+        !AppendLegacyBackgroundRepairs(fw, variants, patches, out_err)) return false;
     out_patches = std::move(patches);
     return true;
 }

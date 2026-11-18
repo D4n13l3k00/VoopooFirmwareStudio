@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <StudioDepsDir>$(MSBuildThisFileDirectory)build\deps\</StudioDepsDir>
+    <UnicornVersion>2.1.4</UnicornVersion>
+    <UnicornSource>$(StudioDepsDir)unicorn-$(UnicornVersion)</UnicornSource>
+    <UnicornBuild>$(StudioDepsDir)unicorn-build</UnicornBuild>
+    <UnicornLibrary>$(UnicornBuild)\Release\unicorn.lib</UnicornLibrary>
+    <UnicornReady>$(UnicornBuild)\$(UnicornVersion)-arm-mt-release-jit-thumb-v2.ready</UnicornReady>
+    <UnicornArchive>$(StudioDepsDir)unicorn-$(UnicornVersion)-source.tar.gz</UnicornArchive>
+    <XzVersion>5.8.1</XzVersion>
+    <XzSource>$(StudioDepsDir)xz-$(XzVersion)</XzSource>
+    <XzBuild>$(StudioDepsDir)xz-build</XzBuild>
+    <XzLibrary>$(XzBuild)\Release\lzma.lib</XzLibrary>
+    <XzReady>$(XzBuild)\$(XzVersion)-mt-release.ready</XzReady>
+    <XzArchive>$(StudioDepsDir)xz-$(XzVersion)-source.tar.gz</XzArchive>
+    <StudioCMake Condition="Exists('$(VSInstallDir)Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe')">$(VSInstallDir)Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe</StudioCMake>
+    <StudioCMake Condition="'$(StudioCMake)'==''">cmake</StudioCMake>
+    <StudioCMakeGenerator>Visual Studio 17 2022</StudioCMakeGenerator>
+    <StudioCMakeGenerator Condition="'$(VisualStudioVersion)' &gt;= '18.0'">Visual Studio 18 2026</StudioCMakeGenerator>
+    <UpxVersion>5.3.0</UpxVersion>
+    <UpxArchive>$(StudioDepsDir)upx-$(UpxVersion)-win64.zip</UpxArchive>
+    <UpxExecutable>$(StudioDepsDir)upx-$(UpxVersion)-win64\upx.exe</UpxExecutable>
+  </PropertyGroup>
+  <Target Name="AcquireUnicorn" Condition="!Exists('$(UnicornSource)\CMakeLists.txt')">
+    <MakeDir Directories="$(StudioDepsDir)" />
+    <DownloadFile SourceUrl="https://codeload.github.com/unicorn-engine/unicorn/tar.gz/refs/tags/$(UnicornVersion)" DestinationFolder="$(StudioDepsDir)" DestinationFileName="unicorn-$(UnicornVersion)-source.tar.gz" />
+    <GetFileHash Files="$(UnicornArchive)" Algorithm="SHA256"><Output TaskParameter="Items" ItemName="_UnicornHash" /></GetFileHash>
+    <Error Condition="'%(_UnicornHash.FileHash)'!='EA8863F095A0136388694E5A6063AFD9BB7650E30243DD6251AF59C5CE5601F4'" Text="Unicorn source archive SHA256 mismatch" />
+    <Exec Command="tar -xf &quot;$(UnicornArchive)&quot; -C &quot;$(StudioDepsDir).&quot;" />
+  </Target>
+  <UsingTask TaskName="StudioPatchUnicornJitBounds" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup><SourceFile ParameterType="System.String" Required="true" /></ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var text = System.IO.File.ReadAllText(SourceFile);
+        var newline = text.Contains("\r\n") ? "\r\n" : "\n";
+        var prefix = "if (base_end >= right) {" + newline + "                size = ";
+        var original = prefix + "base_end - base;";
+        var replacement = prefix + "right - base;";
+        if (text.IndexOf(replacement, System.StringComparison.Ordinal) >= 0)
+            return true;
+        var index = text.IndexOf(original, System.StringComparison.Ordinal);
+        if (index < 0 || text.IndexOf(original, index + original.Length, System.StringComparison.Ordinal) >= 0) {
+            Log.LogError("Unicorn Windows JIT bounds patch: unexpected source; refusing an unverified replacement.");
+            return false;
+        }
+        // The final lazy commit must stop at the reserved allocation boundary.
+        // Upstream 2.1.4 requests another full 4 MiB and faults inside tcg_out8.
+        text = text.Substring(0, index) + replacement + text.Substring(index + original.Length);
+        System.IO.File.WriteAllText(SourceFile, text, new System.Text.UTF8Encoding(false));
+      ]]></Code>
+    </Task>
+  </UsingTask>
+  <UsingTask TaskName="StudioPatchUnicornThumbHooks" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <SourceFile ParameterType="System.String" Required="true" />
+      <BeforeFile ParameterType="System.String" Required="true" />
+      <AfterFile ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var text = System.IO.File.ReadAllText(SourceFile);
+        var newline = text.Contains("\r\n") ? "\r\n" : "\n";
+        var original = System.IO.File.ReadAllText(BeforeFile).Replace("\r\n", "\n").Replace("\n", newline);
+        var replacement = System.IO.File.ReadAllText(AfterFile).Replace("\r\n", "\n").Replace("\n", newline);
+        if (text.IndexOf(replacement, System.StringComparison.Ordinal) >= 0)
+            return true;
+        var index = text.IndexOf(original, System.StringComparison.Ordinal);
+        if (index < 0 || text.IndexOf(original, index + original.Length, System.StringComparison.Ordinal) >= 0) {
+            Log.LogError("Unicorn Thumb hook patch: unexpected source; refusing an unverified replacement.");
+            return false;
+        }
+        text = text.Substring(0, index) + replacement + text.Substring(index + original.Length);
+        System.IO.File.WriteAllText(SourceFile, text, new System.Text.UTF8Encoding(false));
+      ]]></Code>
+    </Task>
+  </UsingTask>
+  <UsingTask TaskName="StudioPatchUnicornArchiveAlias" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup><SourceFile ParameterType="System.String" Required="true" /></ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var text = System.IO.File.ReadAllText(SourceFile);
+        var newline = text.Contains("\r\n") ? "\r\n" : "\n";
+        var original = "  add_custom_command(TARGET ${bundled_tgt_name} POST_BUILD" + newline +
+            "    COMMAND ${CMAKE_COMMAND} -E create_symlink \"$<TARGET_FILE_NAME:${bundled_tgt_name}>\" \"$<TARGET_FILE_DIR:${bundled_tgt_name}>/$<TARGET_PROPERTY:${bundled_tgt_name},SYMLINK_NAME>\"" + newline +
+            "  )";
+        // The .o alias is an install artifact, unused by the linked Windows .lib.
+        // Do not require administrator symlink privileges for a non-install build.
+        var replacement = "  if(UNICORN_INSTALL)" + newline + original + newline + "  endif()";
+        if (text.IndexOf(replacement, System.StringComparison.Ordinal) >= 0)
+            return true;
+        var index = text.IndexOf(original, System.StringComparison.Ordinal);
+        if (index < 0 || text.IndexOf(original, index + original.Length, System.StringComparison.Ordinal) >= 0) {
+            Log.LogError("Unicorn archive alias patch: unexpected source; refusing an unverified replacement.");
+            return false;
+        }
+        text = text.Substring(0, index) + replacement + text.Substring(index + original.Length);
+        System.IO.File.WriteAllText(SourceFile, text, new System.Text.UTF8Encoding(false));
+      ]]></Code>
+    </Task>
+  </UsingTask>
+  <Target Name="PatchUnicornWindowsJit" DependsOnTargets="AcquireUnicorn">
+    <StudioPatchUnicornJitBounds SourceFile="$(UnicornSource)\qemu\accel\tcg\translate-all.c" />
+    <StudioPatchUnicornThumbHooks SourceFile="$(UnicornSource)\qemu\target\arm\translate.c" BeforeFile="$(MSBuildThisFileDirectory)third_party\unicorn-thumb-hooks-before.inc" AfterFile="$(MSBuildThisFileDirectory)third_party\unicorn-thumb-hooks-after.inc" />
+    <StudioPatchUnicornArchiveAlias SourceFile="$(UnicornSource)\cmake\bundle_static.cmake" />
+  </Target>
+  <Target Name="CheckUnicornOutput">
+    <Delete Files="$(UnicornReady)" Condition="!Exists('$(UnicornLibrary)')" />
+  </Target>
+  <Target Name="PrepareUnicorn" BeforeTargets="PrepareForBuild" DependsOnTargets="CheckUnicornOutput;AcquireUnicorn;PatchUnicornWindowsJit" Inputs="$(MSBuildThisFileFullPath);$(MSBuildThisFileDirectory)third_party\unicorn-thumb-hooks-before.inc;$(MSBuildThisFileDirectory)third_party\unicorn-thumb-hooks-after.inc" Outputs="$(UnicornReady)">
+    <Exec Command="&quot;$(StudioCMake)&quot; -S &quot;$(UnicornSource)&quot; -B &quot;$(UnicornBuild)&quot; -G &quot;$(StudioCMakeGenerator)&quot; -A x64 -DUNICORN_ARCH=arm -DBUILD_SHARED_LIBS=OFF -DUNICORN_BUILD_TESTS=OFF -DUNICORN_INSTALL=OFF -DUNICORN_LEGACY_STATIC_ARCHIVE=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" />
+    <Exec Command="&quot;$(StudioCMake)&quot; --build &quot;$(UnicornBuild)&quot; --config Release --target unicorn_archive --parallel" />
+    <Error Condition="!Exists('$(UnicornLibrary)')" Text="Unicorn static ARM library was not produced" />
+    <Touch Files="$(UnicornReady)" AlwaysCreate="true" />
+  </Target>
+  <Target Name="AcquireXz" Condition="!Exists('$(XzSource)\CMakeLists.txt')">
+    <MakeDir Directories="$(StudioDepsDir)" />
+    <DownloadFile SourceUrl="https://github.com/tukaani-project/xz/releases/download/v$(XzVersion)/xz-$(XzVersion).tar.gz" DestinationFolder="$(StudioDepsDir)" DestinationFileName="xz-$(XzVersion)-source.tar.gz" />
+    <GetFileHash Files="$(XzArchive)" Algorithm="SHA256"><Output TaskParameter="Items" ItemName="_XzHash" /></GetFileHash>
+    <Error Condition="'%(_XzHash.FileHash)'!='507825B599356C10DCA1CD720C9D0D0C9D5400B9DE300AF00E4D1EA150795543'" Text="XZ source archive SHA256 mismatch" />
+    <Exec Command="tar -xf &quot;$(XzArchive)&quot; -C &quot;$(StudioDepsDir).&quot;" />
+    <Error Condition="!Exists('$(XzSource)\CMakeLists.txt')" Text="XZ archive has no expected source directory" />
+  </Target>
+  <Target Name="CheckXzOutput">
+    <Delete Files="$(XzReady)" Condition="!Exists('$(XzLibrary)')" />
+  </Target>
+  <Target Name="PrepareXz" BeforeTargets="PrepareForBuild" DependsOnTargets="CheckXzOutput;AcquireXz" Inputs="$(MSBuildThisFileFullPath)" Outputs="$(XzReady)">
+    <Exec Command="&quot;$(StudioCMake)&quot; -S &quot;$(XzSource)&quot; -B &quot;$(XzBuild)&quot; -G &quot;$(StudioCMakeGenerator)&quot; -A x64 -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DXZ_TOOL_XZ=OFF -DXZ_TOOL_XZDEC=OFF -DXZ_TOOL_LZMADEC=OFF -DXZ_TOOL_LZMAINFO=OFF -DXZ_NLS=OFF -DXZ_DOC=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" />
+    <Exec Command="&quot;$(StudioCMake)&quot; --build &quot;$(XzBuild)&quot; --config Release --target liblzma --parallel" />
+    <Error Condition="!Exists('$(XzLibrary)')" Text="XZ static liblzma library was not produced" />
+    <Touch Files="$(XzReady)" AlwaysCreate="true" />
+  </Target>
+  <Target Name="AcquireUpx" Condition="!Exists('$(UpxExecutable)')">
+    <MakeDir Directories="$(StudioDepsDir)" />
+    <DownloadFile SourceUrl="https://github.com/upx/upx/releases/download/v$(UpxVersion)/upx-$(UpxVersion)-win64.zip" DestinationFolder="$(StudioDepsDir)" DestinationFileName="upx-$(UpxVersion)-win64.zip" />
+    <GetFileHash Files="$(UpxArchive)" Algorithm="SHA256"><Output TaskParameter="Items" ItemName="_UpxHash" /></GetFileHash>
+    <Error Condition="'%(_UpxHash.FileHash)'!='D127996C76615E431BE810E9C8D2910DBE3DD400600C5C0C50276FC5A17A9705'" Text="UPX archive SHA256 mismatch" />
+    <Unzip SourceFiles="$(UpxArchive)" DestinationFolder="$(StudioDepsDir)" />
+    <Error Condition="!Exists('$(UpxExecutable)')" Text="UPX archive has no expected Windows x64 executable" />
+  </Target>
+  <Target Name="PackReleaseExecutable" AfterTargets="Link" DependsOnTargets="AcquireUpx" Condition="'$(Configuration)'=='Release'" Inputs="$(TargetPath);$(MSBuildThisFileFullPath)" Outputs="$(TargetPath).upx-$(UpxVersion)-best-lzma.stamp">
+    <PropertyGroup><_UpxTemporary>$(TargetDir).upx-$([System.Guid]::NewGuid()).exe</_UpxTemporary></PropertyGroup>
+    <Copy SourceFiles="$(TargetPath)" DestinationFiles="$(_UpxTemporary)" />
+    <Exec Command="&quot;$(UpxExecutable)&quot; --list &quot;$(_UpxTemporary)&quot;" IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" ConsoleToMSBuild="true" StandardOutputImportance="Low" StandardErrorImportance="Low">
+      <Output TaskParameter="ExitCode" PropertyName="_UpxProbeExit" />
+    </Exec>
+    <Exec Condition="'$(_UpxProbeExit)'=='0'" Command="&quot;$(UpxExecutable)&quot; --decompress &quot;$(_UpxTemporary)&quot;" />
+    <Exec Command="&quot;$(UpxExecutable)&quot; --best --lzma &quot;$(_UpxTemporary)&quot;" />
+    <Exec Command="&quot;$(UpxExecutable)&quot; --test &quot;$(_UpxTemporary)&quot;" />
+    <Copy SourceFiles="$(_UpxTemporary)" DestinationFiles="$(TargetPath)" />
+    <Delete Files="$(_UpxTemporary)" />
+    <Touch Files="$(TargetPath).upx-$(UpxVersion)-best-lzma.stamp" AlwaysCreate="true" />
+    <OnError ExecuteTargets="CleanFailedUpxTemporary" />
+  </Target>
+  <Target Name="CleanFailedUpxTemporary">
+    <Delete Files="$(_UpxTemporary)" Condition="'$(_UpxTemporary)'!=''" />
+  </Target>
+</Project>

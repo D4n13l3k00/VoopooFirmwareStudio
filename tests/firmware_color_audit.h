@@ -6,14 +6,20 @@
 inline bool RunFirmwareColorAudit(const StudioState& source, std::string& error) {
     wchar_t auditDir[32768]{};
     const DWORD auditLen = GetEnvironmentVariableW(L"VOOPOO_COLOR_AUDIT_DIR", auditDir, 32768);
-    const bool exportAudit = auditLen && auditLen < 32768;
+    const bool exportAudit = auditLen && auditLen < 32768 &&
+        source.model == FirmwareModel::DragS && source.edition == FirmwareEdition::Score;
     const fs::path root(auditDir);
     if (exportAudit) fs::create_directories(root);
     const auto& themes = GetPaletteThemes();
     for (size_t themeIndex = 0; themeIndex <= themes.size(); ++themeIndex) {
         StudioState staged;
         staged.firmware = source.firmware;
-        staged.palette = GetDefaultPalette();
+        staged.model = source.model;
+        staged.edition = source.edition;
+        staged.palette = source.palette;
+        staged.referencePalette = source.referencePalette;
+        staged.referenceRecordPalette = source.referenceRecordPalette;
+        staged.referenceBackground = source.referenceBackground;
         if (themeIndex < themes.size()) ApplyPaletteTheme(staged, themes[themeIndex]);
         else {
             // Non-white digits expose the old "all font masks are white" bug.
@@ -26,9 +32,20 @@ inline bool RunFirmwareColorAudit(const StudioState& source, std::string& error)
         if (!BuildColorPatches(staged.firmware, staged.palette, {0, 0, 0}, patches, error) ||
             !staged.firmware.PackWith({}, patches, packed, report, error)) return false;
         StudioState reopened;
+        reopened.model = source.model;
+        reopened.edition = source.edition;
         if (!FirmwarePackage::Parse(packed, reopened.firmware, error)) return false;
-        reopened.palette = GetDefaultPalette();
+        reopened.palette = source.palette;
+        reopened.referencePalette = source.referencePalette;
+        reopened.referenceRecordPalette = source.referenceRecordPalette;
+        reopened.referenceBackground = source.referenceBackground;
         if (!DetectFirmwareColors(reopened.firmware, reopened.palette, reopened.backgroundColor)) return false;
+        for (const auto& role : staged.palette) {
+            if (reopened.GetPaletteColor(role.spec.id).ToRgb565() != role.current.ToRgb565()) {
+                error = std::string("Packed palette role differs: ") + role.spec.id;
+                return false;
+            }
+        }
         std::ofstream cases;
         if (exportAudit) {
             const std::string stem = "theme_" + std::to_string(themeIndex);

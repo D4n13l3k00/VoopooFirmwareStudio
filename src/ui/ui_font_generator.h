@@ -2,6 +2,7 @@
 
 
 #include "app_state.h"
+#include "studio_preferences.h"
 #include "font_renderer.h"
 #include "presets.h"
 #include <windows.h>
@@ -10,14 +11,17 @@
 
 struct FontGenState {
     FontRenderer fontRenderer;
-    std::vector<SystemFont> popularFonts;
+    std::vector<SystemFont> installedFonts;
+    std::string fontCatalogError;
     int selectedFontIdx = 0;
     std::string fontDisplayName = "None";
     std::vector<Preset> presets;
     int selectedPresetIdx = 0;
+    FirmwareModel presetModel = FirmwareModel::DragS;
+    FirmwareEdition presetEdition = FirmwareEdition::Score;
 
     RenderOptions fontOpts;
-    int fontZoom = 6;
+    int fontZoom = StudioPreferences::Get().fontZoom;
     bool fontShowGrid = true;
     char fontOutDirBuf[512] = "exported-fonts";
     bool fontExportAll = false;
