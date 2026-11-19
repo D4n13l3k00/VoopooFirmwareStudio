@@ -74,7 +74,8 @@ bool ArmRuntime::Call(uint32_t address, uint32_t stack,
         !Check(uc_reg_write(engine_, UC_ARM_REG_LR, &link), "Setting native return", error)) return false;
     // Host scheduling and LCD hooks consume wall time, not guest instructions.
     // Keep the instruction budget fixed; use wall time only as an emergency guard.
-    const auto result = uc_emu_start(engine_, address | 1, ReturnAddress, 10000000, 20000000);
+    const auto result = uc_emu_start(engine_, address | 1, ReturnAddress,
+        NativeCallTimeoutMicroseconds, NativeCallInstructionLimit);
     uint32_t pc = 0;
     if (!Check(uc_reg_read(engine_, UC_ARM_REG_PC, &pc), "Reading native PC", error)) return false;
     if (result != UC_ERR_OK || pc != ReturnAddress) {

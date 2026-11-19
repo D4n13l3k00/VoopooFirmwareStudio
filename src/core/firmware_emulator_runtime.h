@@ -8,6 +8,9 @@
 #include <cstdint>
 
 namespace FirmwareEmulator {
+inline constexpr uint64_t NativeCallTimeoutMicroseconds = 10000000;
+inline constexpr size_t NativeCallInstructionLimit = 20000000;
+
 // Owns one Cortex-M execution context. Backend hooks observe hardware only;
 // native drawing instructions and resource reads must not be replaced.
 class ArmRuntime {

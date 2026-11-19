@@ -178,8 +178,12 @@ inline bool RunSxPageCoverageRegressions(std::string& error, std::ostream* proof
                 }
                 if (!editor.Undo()) return fail("native move cannot be undone");
                 Frame undone;
-                if (!renderer.Render(editor, device, undone) || undone.rgba != stock.rgba || editor.HasUnsavedChanges())
-                    return fail("native move Undo did not restore stock code");
+                if (!renderer.Render(editor, device, undone))
+                    return fail("native move Undo render failed: " + undone.error);
+                if (undone.rgba != stock.rgba)
+                    return fail("native move Undo changed stock LCD pixels");
+                if (editor.HasUnsavedChanges())
+                    return fail("native move Undo left unsaved document changes");
                 Point invalid;
                 invalid.y = element.maximumOffset.y + 1;
                 if (editor.SetLayoutOffset(index, invalid, error) || editor.HasUnsavedChanges()) return fail("unsafe native bounds accepted");

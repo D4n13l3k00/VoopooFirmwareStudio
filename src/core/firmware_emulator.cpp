@@ -1,6 +1,7 @@
 #include "firmware_emulator.h"
 #include "app_state.h"
 #include "firmware_emulator_backend.h"
+#include "firmware_emulator_runtime.h"
 #include "firmware_emulator_screens.h"
 #include "firmware_layout.h"
 #include "firmware_emulator_sx_score.h"
@@ -545,9 +546,10 @@ struct Renderer::Impl {
             !Check(uc_reg_write(engine, UC_ARM_REG_LR, &link), "Seeding native return", error)) return false;
         // Bulk observation includes a complete timeline and host-side work at
         // every boundary. Budget wall time per frame; retain the guest instruction cap.
-        const uint64_t timeout = logoRunning ? 10000000ull *
-            (frameObserver ? FirmwareLogo::FrameCount(source->screenPatches[logoTarget]) : 1u) : 500000ull;
-        const uc_err result = uc_emu_start(engine, address | 1, ReturnAddress, timeout, logoRunning ? 200000000 : 20000000);
+        const uint64_t timeout = logoRunning ? NativeCallTimeoutMicroseconds *
+            (frameObserver ? FirmwareLogo::FrameCount(source->screenPatches[logoTarget]) : 1u) : NativeCallTimeoutMicroseconds;
+        const uc_err result = uc_emu_start(engine, address | 1, ReturnAddress, timeout,
+            logoRunning ? 200000000 : NativeCallInstructionLimit);
         uint32_t pc = 0;
         if (!Check(uc_reg_read(engine, UC_ARM_REG_PC, &pc), "Reading stopped CPU", error)) return false;
         if (fault != Fault::None) {
