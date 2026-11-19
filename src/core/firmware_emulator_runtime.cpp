@@ -72,13 +72,20 @@ bool ArmRuntime::Call(uint32_t address, uint32_t stack,
     const uint32_t link = ReturnAddress | 1;
     if (!Check(uc_reg_write(engine_, UC_ARM_REG_SP, &stack), "Setting native stack", error) ||
         !Check(uc_reg_write(engine_, UC_ARM_REG_LR, &link), "Setting native return", error)) return false;
-    const auto result = uc_emu_start(engine_, address | 1, ReturnAddress, 500000, 20000000);
+    // Host scheduling and LCD hooks consume wall time, not guest instructions.
+    // Keep the instruction budget fixed; use wall time only as an emergency guard.
+    const auto result = uc_emu_start(engine_, address | 1, ReturnAddress, 10000000, 20000000);
     uint32_t pc = 0;
     if (!Check(uc_reg_read(engine_, UC_ARM_REG_PC, &pc), "Reading native PC", error)) return false;
     if (result != UC_ERR_OK || pc != ReturnAddress) {
         char location[32];
         snprintf(location, sizeof(location), " at 0x%08X", pc);
-        error = std::string(result != UC_ERR_OK ? uc_strerror(result) : "Native execution interrupted or exceeded its limit") + location;
+        size_t timedOut = 0;
+        if (result == UC_ERR_OK &&
+            !Check(uc_query(engine_, UC_QUERY_TIMEOUT, &timedOut), "Reading native timeout status", error)) return false;
+        const char* reason = result != UC_ERR_OK ? uc_strerror(result) :
+            timedOut ? "Native renderer wall-time limit reached" : "Native execution stopped before return or reached its instruction limit";
+        error = std::string(reason) + location;
         return false;
     }
     return true;

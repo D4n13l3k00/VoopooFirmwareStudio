@@ -1,6 +1,7 @@
 #pragma once
 #include <unicorn/unicorn.h>
 #include <unicorn/arm.h>
+#include "../src/core/firmware_emulator_runtime.h"
 #include <array>
 #include <ostream>
 #include <string>
@@ -75,5 +76,29 @@ inline bool RunUnicornJitRegressions(std::string& error, std::ostream* report = 
     if (after.PrivateUsage > before.PrivateUsage + size_t(128) * 1024 * 1024) {
         error = "Closing native engines retains over 128 MiB of committed memory"; return false;
     }
+    FirmwareEmulator::ArmRuntime runtime;
+    const std::array<uint8_t, 6> boundedCode{0x01, 0x30, 0x70, 0x47, 0xfe, 0xe7}; // ADDS; BX lr; B self.
+    if (!runtime.Open(boundedCode, 0x10000, 0x20000000, 4096, UC_CPU_ARM_CORTEX_M4, {}, error)) return false;
+    bool delayed = false;
+    uc_hook delayHook = 0;
+    const auto delayOnce = +[](uc_engine*, uint64_t, uint32_t, void* data) {
+        auto& delayed = *static_cast<bool*>(data);
+        if (!delayed) { delayed = true; Sleep(650); }
+    };
+    if (!check(uc_hook_add(runtime.Raw(), &delayHook, UC_HOOK_CODE,
+        reinterpret_cast<void*>(delayOnce), &delayed, 1, 0), "Simulating slow native host")) return false;
+    if (!runtime.Call(0x10000, 0x20001000, {41, 0, 0, 0}, error)) return false;
+    uint32_t slowResult = 0;
+    if (!check(uc_reg_read(runtime.Raw(), UC_ARM_REG_R0, &slowResult), "Reading delayed native result") ||
+        !check(uc_hook_del(runtime.Raw(), delayHook), "Removing host delay hook")) return false;
+    if (!delayed || slowResult != 42) {
+        error = "Host scheduling delay changed a valid native call result"; return false;
+    }
+    if (runtime.Call(0x10004, 0x20001000, {}, error) ||
+        error.find("instruction limit") == std::string::npos) {
+        error = "Native instruction budget did not stop an infinite guest loop"; return false;
+    }
+    error.clear();
+    if (report) *report << "Native runtime: delayed host preserves result; infinite guest remains instruction-bounded: OK\n";
     return true;
 }
