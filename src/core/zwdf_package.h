@@ -96,3 +96,7 @@ bool FirmwareRecordPaletteColor(
     const char* roleId,
     Rgb8& color
 );
+
+// Compare a native closure while admitting only validated S/X palette instructions.
+bool MatchesSxPaletteCode(const FirmwarePackage& stock, const HardwareRecord& candidate,
+    uint32_t address, size_t length);

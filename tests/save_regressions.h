@@ -181,6 +181,27 @@ inline bool RunExportReviewRegressions(std::string& error) {
     screen.enabled = true;
     screen.pixels.assign(size_t(FirmwareLogo::Width) * FirmwareLogo::Height * 2, 0x31);
     studio.SetScreenPatch(FirmwareLogo::Target::Boot, screen);
+    studio.SetPaletteColor(0, Rgb8::FromRgb565(studio.palette.front().current.ToRgb565() ^ 0x07e0));
+    std::vector<CodePatch> palettePatches;
+    if (!BuildColorPatches(studio.firmware, studio.palette, studio.backgroundColor, palettePatches, error)) return false;
+    bool paletteGuardChecked = false;
+    for (const auto& patch : palettePatches) {
+        if (!patch.id.starts_with("palette_") || patch.replacement.size() != 6) continue;
+        for (size_t r = 0; r < patch.locations.size(); ++r) {
+            for (size_t at : patch.locations[r]) {
+                auto candidate = studio.firmware.records[r];
+                std::copy(patch.replacement.begin(), patch.replacement.end(), candidate.image.begin() + at);
+                const uint32_t address = candidate.linked_base + static_cast<uint32_t>(at);
+                if (!check(MatchesSxPaletteCode(studio.firmware, candidate, address, patch.replacement.size()),
+                    "native menu palette guard rejected valid color operands")) return false;
+                candidate.image[at + 1] ^= 1; // Change MOVS destination, not its color immediate.
+                if (!check(!MatchesSxPaletteCode(studio.firmware, candidate, address, patch.replacement.size()),
+                    "native menu palette guard accepted a changed destination register")) return false;
+                paletteGuardChecked = true;
+            }
+        }
+    }
+    if (!check(paletteGuardChecked, "native menu palette guard scenario had no mapped color site")) return false;
     const auto prepared = FirmwareSave::Prepare(studio.CreateFileSnapshot());
     if (!check(prepared->Valid(), "valid review failed") ||
         !check(prepared->Revisions().size() == studio.firmware.records.size(), "review omitted hardware revisions") ||

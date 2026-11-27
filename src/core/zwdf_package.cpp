@@ -998,6 +998,58 @@ bool BuildFactoryColorPatches(const FirmwarePackage& fw, const ColorProfile& pro
 }
 } // namespace
 
+bool MatchesSxPaletteCode(const FirmwarePackage& stock, const HardwareRecord& candidate,
+    uint32_t address, size_t length) {
+    const auto record = std::find_if(stock.records.begin(), stock.records.end(), [&](const HardwareRecord& item) {
+        return item.device_code[0] == candidate.device_code[0] && item.device_code[1] == candidate.device_code[1] &&
+            item.linked_base == candidate.linked_base;
+    });
+    if (record == stock.records.end() || address < record->linked_base) return false;
+    const size_t begin = address - record->linked_base;
+    if (begin > record->image.size() || length > record->image.size() - begin ||
+        begin > candidate.image.size() || length > candidate.image.size() - begin) return false;
+    if (std::equal(record->image.begin() + begin, record->image.begin() + begin + length,
+        candidate.image.begin() + begin)) return true;
+    ColorProfile profile{};
+    ColorVariants variants{};
+    std::string error;
+    if (!ResolveColorProfile(stock, profile, variants, error)) return false;
+    const size_t variant = variants[size_t(record - stock.records.begin())];
+    const size_t end = begin + length;
+    for (size_t at = begin; at < end;) {
+        if (record->image[at] == candidate.image[at]) { ++at; continue; }
+        size_t next = at;
+        Rgb8 color;
+        if (profile.factory) {
+            const auto& hardware = profile.factory[variant];
+            for (size_t i = 0; i < hardware.site_count; ++i) {
+                const auto& site = hardware.sites[i];
+                const size_t bytes = FactoryColorSiteLength(site.encoding);
+                if (site.offset < begin || site.offset > at || at - site.offset >= bytes ||
+                    bytes > end - site.offset) continue;
+                bool original = false;
+                if (ReadFactoryColorSite(candidate, site, color, original)) next = site.offset + bytes;
+                break;
+            }
+        } else {
+            for (size_t i = 0; i < profile.role_count && next == at; ++i) {
+                const auto& role = profile.roles[i];
+                for (const auto& site : role.sites[variant]) {
+                    if (!site.offset) break;
+                    const size_t bytes = ColorSiteLength(role.encoding);
+                    if (site.offset < begin || site.offset > at || at - site.offset >= bytes ||
+                        bytes > end - site.offset) continue;
+                    if (ReadColorSite(candidate, site, role.encoding, color)) next = site.offset + bytes;
+                    break;
+                }
+            }
+        }
+        if (next == at) return false;
+        at = next;
+    }
+    return true;
+}
+
 bool FirmwareRecordPaletteColor(const FirmwarePackage& fw, uint16_t deviceCode,
                                 const char* roleId, Rgb8& color) {
     FirmwareModel model;

@@ -401,7 +401,7 @@ bool NativeMatches(const HardwareRecord& r, const Profile& p, std::string& error
         const size_t at = painter.entry-r.linked_base, bytes = painter.end-painter.entry;
         if (at > b->image.size() || bytes > b->image.size()-at ||
             Read32(b->image.data()+at) != painter.prologue ||
-            !std::equal(b->image.begin()+at,b->image.begin()+at+bytes,r.image.begin()+at)) {
+            !MatchesSxPaletteCode(Stock(p.edition), r, painter.entry, bytes)) {
             error = "Native menu requires its exact mapped paint-only battery HUD and complete PUSH.W entry"; return false;
         }
     }
@@ -411,7 +411,7 @@ bool NativeMatches(const HardwareRecord& r, const Profile& p, std::string& error
             const size_t at = painter.entry-r.linked_base, bytes = painter.end-painter.entry;
             if (at > b->image.size() || bytes > b->image.size()-at ||
                 Read32(b->image.data()+at) != painter.prologue ||
-                !std::equal(b->image.begin()+at,b->image.begin()+at+bytes,r.image.begin()+at)) {
+                !MatchesSxPaletteCode(Stock(p.edition), r, painter.entry, bytes)) {
                 error = "Native menu requires its exact mapped Score/Puff paint closures and normalization prefix"; return false;
             }
         }
@@ -823,11 +823,19 @@ bool Apply(std::vector<uint8_t>& packedFirmware, Settings settings, BuildReport&
     if (!settings.enabled) return true;
     FirmwarePackage package;
     if (!FirmwarePackage::Parse(packedFirmware,package,error)) return false;
-    if (!Supported(package)) { error = "Native menu requires recognized DRAG S Score or Factory native hooks"; return false; }
+    for (const auto& r : package.records) {
+        const auto* p = Find(r);
+        if (!p) { error = "Native menu hardware identity is unsupported"; return false; }
+        if (HasEnvelope(r)) { error = "Native menu must be extracted before rebuilding its outer envelope"; return false; }
+        if (LooksDamaged(r, *p)) { error = "Native menu outer envelope is damaged"; return false; }
+        if (!NativeMatches(r, *p, error)) {
+            error = "HW " + std::to_string(Code(r)) + ": " + error;
+            return false;
+        }
+    }
     size_t ranges = 0, bytes = 0;
     for (auto& r : package.records) {
         const auto& p = *Find(r);
-        if (HasEnvelope(r)) { error = "Native menu must be extracted before rebuilding its outer envelope"; return false; }
         const auto hooks = Hooks(r,p,(r.image.size()+3)&~size_t(3),CurrentLayout(settings.enabledItems));
         ranges += hooks.size()+1;
         for (const auto& h : hooks) bytes += h.size;

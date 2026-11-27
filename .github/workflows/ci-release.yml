@@ -63,22 +63,6 @@ jobs:
             throw "Project and editing tests failed with exit code $($process.ExitCode)"
           }
 
-      - name: Verify Native UI Layouts
-        shell: pwsh
-        run: |
-          $process = Start-Process -FilePath .\build\Release\VoopooFirmwareStudio.exe -ArgumentList '--layout-test' -Wait -PassThru
-          if ($process.ExitCode -ne 0) {
-            throw "Native layout tests failed with exit code $($process.ExitCode)"
-          }
-
-      - name: Verify All Native Screens and Revisions
-        shell: pwsh
-        run: |
-          $process = Start-Process -FilePath .\build\Release\VoopooFirmwareStudio.exe -ArgumentList '--coverage-test=all' -Wait -PassThru
-          if ($process.ExitCode -ne 0) {
-            Get-Content studio_debug.log
-            throw "Native coverage tests failed with exit code $($process.ExitCode)"
-          }
 
       - name: Run Smoke Tests
         shell: pwsh
@@ -119,10 +103,60 @@ jobs:
             *.LICENSE
           if-no-files-found: error
 
+  validate:
+    name: ${{ matrix.name }}
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: layout
+            name: Native UI layouts
+            argument: --layout-test
+          - id: native
+            name: All native screens and revisions
+            argument: --coverage-test=all
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: VoopooFirmwareStudio-windows-x64
+          path: build/verified-artifacts
+
+      - name: Prepare the built executable
+        shell: pwsh
+        run: |
+          $binaries = @(Get-ChildItem build/verified-artifacts/VoopooFirmwareStudio-*-Release.exe)
+          if ($binaries.Count -ne 1) { throw "Expected exactly one built release executable" }
+          New-Item -ItemType Directory -Force build/Release | Out-Null
+          Copy-Item $binaries[0].FullName build/Release/VoopooFirmwareStudio.exe
+
+      - name: Run native validation
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath .\build\Release\VoopooFirmwareStudio.exe -ArgumentList '${{ matrix.argument }}' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            if (Test-Path studio_debug.log) { Get-Content studio_debug.log }
+            throw "Native validation failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Upload validation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-${{ matrix.id }}
+          path: studio_debug.log
+          if-no-files-found: warn
+
   release:
     name: Publish Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, validate]
     runs-on: ubuntu-latest
     permissions:
       contents: write

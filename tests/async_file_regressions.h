@@ -316,8 +316,16 @@ inline bool RunAsyncFileRegressions(std::string& error, std::ostream* log = null
         UiResourceStudio::FirmwareReviewSnapshot review;
         if (!check(UiResourceStudio::SaveFirmware(studio, nullptr, false, utf8(path)), "review was not queued") ||
             !awaitReview(review)) return false;
-        if (!check(review.prepared->Valid() && std::filesystem::is_empty(root) && studio.HasUnsavedChanges(),
-            "review wrote files or marked the project saved before confirmation")) return false;
+        if (!review.prepared->Valid()) {
+            error = "export review preparation failed";
+            for (const auto& issue : review.prepared->Issues()) error += "; " + issue;
+            for (const auto& revision : review.prepared->Revisions())
+                for (const auto& issue : revision.issues)
+                    error += "; HW " + std::to_string(revision.hardwareCode) + ": " + issue;
+            return false;
+        }
+        if (!check(std::filesystem::is_empty(root), "review wrote files before confirmation") ||
+            !check(studio.HasUnsavedChanges(), "review marked the project saved before confirmation")) return false;
         if (!check(renderedText.find(Tr(i18n::Str::ExportReviewTitle)) != std::string::npos &&
             renderedText.find(Tr(i18n::Str::ExportReviewChanges)) != std::string::npos &&
             renderedText.find(Tr(i18n::Str::ExportReviewCapacity)) != std::string::npos &&
